@@ -1,0 +1,27 @@
+[project]
+name = "landgraph-pydantic-mvp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi[standard]>=0.115.12",
+    "fastapi-cli>=0.0.5",
+    "langchain>=0.3.24",
+    "langgraph>=0.4.1",
+    "openai>=1.76.2",
+    "pydantic-ai>=0.1.8",
+    "uvicorn>=0.34.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "ruff>=0.6.2",
+    "pytest>=8.3.5",
+    "httpx>=0.28.1",
+    "pytest-asyncio>=0.26.0",
+]
