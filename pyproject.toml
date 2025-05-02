@@ -11,8 +11,9 @@ dependencies = [
     "langgraph>=0.4.1",
     "openai>=1.76.2",
     "pydantic-ai>=0.1.8",
-    "uvicorn[standard]>=0.22.0",     # ← add this
+    "uvicorn[standard]>=0.22.0",
     "langgraph-supervisor>=0.0.20",
+    "langchain-openai>=0.3.16",
 ]
 
 [tool.uv]
