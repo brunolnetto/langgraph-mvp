@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
     image: langgraph_app_image:latest
-    container_name: retail_data_init
+    container_name: data_init
     command: ["python", "./scripts/generate_data.py"]
     volumes:
       - ./data:/app/data
