@@ -624,9 +624,10 @@ dependencies = [
     { name = "httpx" },
     { name = "langchain" },
     { name = "langgraph" },
+    { name = "langgraph-supervisor" },
     { name = "openai" },
     { name = "pydantic-ai" },
-    { name = "uvicorn" },
+    { name = "uvicorn", extra = ["standard"] },
 ]
 
 [package.dev-dependencies]
@@ -643,9 +644,10 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "langchain", specifier = ">=0.3.24" },
     { name = "langgraph", specifier = ">=0.4.1" },
+    { name = "langgraph-supervisor", specifier = ">=0.0.20" },
     { name = "openai", specifier = ">=1.76.2" },
     { name = "pydantic-ai", specifier = ">=0.1.8" },
-    { name = "uvicorn", specifier = ">=0.34.2" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.22.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -757,6 +759,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/97/7a/5fede018d8b9100db14211cfdb94aefd0e5f2e9ae738072f3d4cc443465b/langgraph_sdk-0.1.66.tar.gz", hash = "sha256:81474ad4555a06004cc7a2f4ab477135d5eaf7db11fbcf2a69257fb2d717582e", size = 44049, upload_time = "2025-04-30T22:59:09.085Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/97/06/87ce0b8043ba5a4ec8369a243f3140f8fd9d9b7aab1d8a9351711739beea/langgraph_sdk-0.1.66-py3-none-any.whl", hash = "sha256:f781c63f3e913d3d6bedb02cb84d775cda64e3cdf3282fd387bdd8faaf53c603", size = 47584, upload_time = "2025-04-30T22:59:07.953Z" },
+]
+
+[[package]]
+name = "langgraph-supervisor"
+version = "0.0.20"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "langchain-core" },
+    { name = "langgraph" },
+    { name = "langgraph-prebuilt" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/09/06/35454dd162439c5f3c27f5de82a64684fc4f56735c810981007f6388e2a8/langgraph_supervisor-0.0.20.tar.gz", hash = "sha256:c359bf848401a2f0e7d34edd32425aca699862f71c2780e864debcbd9acae15e", size = 18631, upload_time = "2025-05-01T18:54:15.535Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fa/a2/c41eb82629538d2e0bc5a9abff3e3981e2bf51edc819e92f727d7f266af8/langgraph_supervisor-0.0.20-py3-none-any.whl", hash = "sha256:24dbbcd8bda396bb647f7b980aca5a1e7da1a1750715c3c936150ae6342a61fc", size = 14424, upload_time = "2025-05-01T18:54:14.62Z" },
 ]
 
 [[package]]
