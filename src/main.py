@@ -48,7 +48,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 # Healthcheck
-@app.get("/health")
+@app.get("/healthcheck")
 async def health_check():
     return {"status": "ok"}
 
