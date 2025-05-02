@@ -1,10 +1,11 @@
 import random
 from faker import Faker
-import pandas as pd
 from pathlib import Path
 import logging
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Callable
+
+import pandas as pd
 import duckdb
 
 
