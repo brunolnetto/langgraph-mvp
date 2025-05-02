@@ -14,6 +14,9 @@ dependencies = [
     "uvicorn[standard]>=0.22.0",
     "langgraph-supervisor>=0.0.20",
     "langchain-openai>=0.3.16",
+    "word2number>=1.1",
+    "sympy>=1.14.0",
+    "scipy>=1.15.2",
 ]
 
 [tool.uv]
