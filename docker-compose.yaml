@@ -2,11 +2,12 @@ services:
   init:
     build:
       context: .
+      dockerfile: Dockerfile
     image: langgraph_app_image:latest
     container_name: retail_data_init
-    command: ["python", "generate_data.py"]
+    command: ["python", "./scripts/generate_data.py"]
     volumes:
-      - data:/app/data
+      - ./data:/app/data
   
   app:
     image: langgraph_app_image:latest
@@ -16,9 +17,11 @@ services:
     env_file:
       - .env
     volumes:
-      - data:/app/data
+      - ./data:/app/data
     depends_on:
-      - init
+      init:
+        condition: service_completed_successfully
+
     healthcheck:
       test: ["CMD", "curl", "-f", "localhost:8000/healthcheck"]
       interval: 30s
