@@ -24,4 +24,6 @@ jobs:
 
       - name: Run tests
         # For example, using `pytest`
-        run: uv run pytest tests
+        run: | 
+          # If there is not tests, then skip
+          uv run --locked --all-extras --dev -m pytest
