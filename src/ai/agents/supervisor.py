@@ -1,12 +1,14 @@
+# src/ai/agents/supervisor.py
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
 from langgraph_supervisor import create_supervisor
 from langchain_openai import ChatOpenAI
 
 from src.ai.config import model_name
-from src.ai.utils import save_memory, prepare_model_inputs
+from src.ai.utils import save_memory
 from src.ai.agents.customer import customer_agent 
 from src.ai.agents.report import report_agent
+from src.ai.agents.humor import humor_agent
 
 # Define your model
 llm_model = ChatOpenAI(model=model_name)
@@ -14,7 +16,8 @@ llm_model = ChatOpenAI(model=model_name)
 # List of agents
 agents = [
     customer_agent, 
-    report_agent
+    report_agent,
+    humor_agent
 ]
 
 # List of tools
@@ -30,6 +33,7 @@ system_prompt_tuple = (
     "You can use: ",
     "1. the customer agent for retrieval of profile, feedback and support tickets.",
     "2. the report agent for KPI metrics.",
+    "3. the joker agent for jokes.",
     "Be polite and concise.",
     "If you don't know the answer, say 'I don't know'.",
     "If you need to ask a question, ask it.",
@@ -38,12 +42,9 @@ system_prompt_tuple = (
 
 system_prompt="\n".join(system_prompt_tuple)
 
-memory = MemorySaver()
-store = InMemoryStore()
-
 supervisor = create_supervisor(
     model=llm_model, 
     prompt=system_prompt,
-    agents=[customer_agent, report_agent],
+    agents=agents,
     tools=tools
 ).compile()

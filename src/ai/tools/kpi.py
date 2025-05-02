@@ -1,8 +1,20 @@
 from typing import List
-from src.ai.schemas import KPI
+from src.ai.models.kpi import KPI
 from src.repositories.kpi import FakeKPIRepository
 
 repo = FakeKPIRepository()
+
+def list_available_kpis() -> str:
+    """
+    Lists all available KPI metric names.
+    
+    This function retrieves all KPIs from the repository and returns their metric names as a comma-separated string.
+    
+    Returns:
+        str: A comma-separated string of all available KPI metric names.
+    """
+    kpis = fetch_kpis()
+    return ", ".join([k.metric for k in kpis])
 
 def fetch_kpis() -> List[KPI]:
     """
@@ -34,4 +46,17 @@ def get_kpi_by_metric(metric_name: str) -> KPI:
         ValueError: If no KPI with the specified metric name is found.
         RepositoryError: If there is an issue accessing the KPI repository.
     """
-    return repo.get_by_metric(metric_name)
+    try:
+        kpi = repo.get_by_metric(metric_name)
+        return (
+            f"KPI: {kpi.metric}\n"
+            f"Value: {kpi.value} {kpi.unit}\n"
+            f"Target: {kpi.target} {kpi.unit}\n"
+            f"Trend: {kpi.trend}\n"
+            f"Last updated: {kpi.last_updated}"
+        )
+    except ValueError as e:
+        return f"No KPI found with the name '{metric_name}'. Please try one of the known metrics like 'Revenue' or 'Churn Rate'."
+    except Exception as e:
+        return f"An error occurred while fetching the KPI: {str(e)}"
+

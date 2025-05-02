@@ -28,7 +28,7 @@ def collect_graph_states(graph, inputs, config=None):
     """
     states = []
     for state in graph.stream(inputs, config=config, stream_mode="values"):
-        states.append(swtate)
+        states.append(state)
     return states
 
 def save_memory(memory: str, *, config: RunnableConfig, store: Annotated[BaseStore, InjectedStore()]) -> str:

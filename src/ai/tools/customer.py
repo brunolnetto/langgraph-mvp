@@ -1,5 +1,5 @@
 from typing import List
-from src.ai.schemas import CustomerProfile
+from src.ai.models.customer import CustomerProfile
 from src.repositories.customer import FakeCustomerRepository
 
 repo = FakeCustomerRepository()

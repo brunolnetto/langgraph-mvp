@@ -1,4 +1,4 @@
-# ai/agents/customer.py
+# src/ai/agents/customer.py
 from langgraph.prebuilt import create_react_agent
 
 from src.ai.config import provider_name, model_name

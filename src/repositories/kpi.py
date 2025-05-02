@@ -1,9 +1,10 @@
 from typing import List
-from datetime import datetime
-from src.ai.schemas import KPI
+from datetime import datetime, timedelta
+from src.ai.models.kpi import KPI
 
 class FakeKPIRepository:
     def fetch_all(self) -> List[KPI]:
+        now = datetime.now()
         return [
             KPI(
                 metric="Revenue",
@@ -11,7 +12,10 @@ class FakeKPIRepository:
                 unit="USD",
                 target=150000.00,
                 trend="up",
-                last_updated=datetime.now().isoformat()
+                last_updated=now - timedelta(days=1),
+                critical_threshold=100000.00,
+                status="on_track",
+                owner="Finance Team"
             ),
             KPI(
                 metric="New Users",
@@ -19,7 +23,10 @@ class FakeKPIRepository:
                 unit="users",
                 target=500,
                 trend="down",
-                last_updated=datetime.now().isoformat()
+                last_updated=now - timedelta(hours=6),
+                critical_threshold=250,
+                status="at_risk",
+                owner="Growth Team"
             ),
             KPI(
                 metric="Churn Rate",
@@ -27,13 +34,15 @@ class FakeKPIRepository:
                 unit="%",
                 target=3.0,
                 trend="stable",
-                last_updated=datetime.now().isoformat()
+                last_updated=now,
+                critical_threshold=5.0,
+                status="off_track",
+                owner="Customer Success"
             )
         ]
 
     def get_by_metric(self, metric_name: str) -> KPI:
-        all_kpis = self.fetch_all()
-        for kpi in all_kpis:
-            if kpi.metric.lower() == metric_name.lower():
-                return kpi
-        raise ValueError(f"KPI '{metric_name}' not found.")
+        return next(
+            (kpi for kpi in self.fetch_all() if kpi.metric.lower() == metric_name.lower()),
+            ValueError(f"KPI '{metric_name}' not found.")
+        )
