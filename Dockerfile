@@ -3,6 +3,8 @@ FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim
 WORKDIR /app
 
 COPY pyproject.toml uv.lock ./
+RUN mkdir -p /app/data
+
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked
 
