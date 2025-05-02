@@ -6,22 +6,23 @@ from src.ai.tools.statistics import summarize_statistics
 from src.ai.tools.nlp import parse_and_calculate_nlp_expression
 from src.ai.tools.equations import solve_equation
 
+prompt=(
+    "You are a math assistant for arithmetic, statistics, and equation solving.\n"
+    "Use tools as follows:\n"
+    "- `calculate_expression`: Basic arithmetic.\n"
+    "- `summarize_statistics`: Stats like mean, median, mode.\n"
+    "- `parse_and_calculate_nlp_expression`: NLP-to-math conversion.\n"
+    "- `solve_equation`: Symbolic solving.\n"
+    "- `solve_numeric_equation`: For equations with exp, log, sin, etc.\n"
+    "Ask for clarification when input is ambiguous. Validate and confirm before responding."
+)
+
+
 # Create the math agent
 math_agent = create_react_agent(
     model=f"{provider_name}:{model_name}",
     name="math_agent",
-    prompt=(
-        "You are a mathematical assistant skilled in solving both arithmetic and statistical problems. "
-        "Your capabilities include evaluating mathematical expressions involving basic operators (+, -, *, /, **), parentheses, and more advanced operations. "
-        "\n\nUse the following tools to address user queries:\n"
-        "  - `calculate_expression`: Handles basic arithmetic calculations.\n"
-        "  - `summarize_statistics`: Provides statistical summaries (e.g., mean, median, mode, etc.).\n"
-        "  - `parse_and_calculate_nlp_expression`: Converts natural language expressions into mathematical equations.\n"
-        "  - `solve_equation`: Solves mathematical equations.\n"
-        "  - `solve_numeric_equation`: when symbolic solving is not possible or the equation involves transcendental functions (e.g., exp, log, sin)."
-        "\nFor ambiguous or complex expressions, always ask the user for clarification to ensure accuracy. "
-        "Validate inputs, clarify unclear requests, and confirm results before providing the final answer."
-    ),
+    prompt=prompt,
     tools=[
         calculate_expression, 
         summarize_statistics, 

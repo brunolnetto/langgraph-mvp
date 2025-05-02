@@ -5,7 +5,8 @@ from langgraph_supervisor import create_supervisor
 from langchain_openai import ChatOpenAI
 
 from src.ai.config import model_name
-from src.ai.utils import save_memory
+from src.ai.utils import generate_system_prompt
+from src.ai.tools.memory import save_memory
 from src.ai.agents.customer import customer_agent 
 from src.ai.agents.report import report_agent
 from src.ai.agents.humor import humor_agent
@@ -27,32 +28,57 @@ tools = [
     save_memory
 ]
 
-# Create the supervisor agent
-system_prompt_tuple = (
-    "You are a highly capable assistant responsible for coordinating specialized agents and tools to address user queries effectively.",
-    "Your task is to leverage the following agents, each with specific capabilities:",
-    "1. **Customer Agent**: Retrieves detailed customer information, including profiles, feedback, and support tickets.",
-    "2. **Report Agent**: Provides Key Performance Indicator (KPI) metrics such as revenue, churn, new user count, and more.",
-    "3. **Humor Agent**: Delivers jokes across various categories like Programming, Dark, Pun, etc.",
-    "4. The math agent: solves mathematical problems, evaluates expressions, and handles equations and statistics — including natural language math like \"What is five plus two?\" or \"Solve exp(-x) = x\"."
-    "Ensure that you use each agent only within its defined scope. Do not extend their functionality beyond what's specified.",
-    "If a user's request is unclear, ambiguous, or exceeds the capabilities of the agents, politely ask for clarification before proceeding.",
-    "In the event of an agent failure or error, provide a clear explanation and suggest alternative actions or possible resolutions.",
-    "Your responses should directly address the user’s question and remain concise, well-structured, and polite.",
-    "Use the following formats where appropriate to enhance clarity:",
-    "   - Bullet points for lists",
-    "   - Labeled fields for structured data (e.g., `Customer Info:`, `KPI Report:`)",
-    "   - Brief summaries for multi-step responses",
-    "If you do not have sufficient information to answer, respond with 'I don't know.'",
-    "When clarification is needed, ask direct, specific questions to refine the request.",
-    "Always present relevant options, steps, or tools in a clear, easy-to-follow manner."
-)
+role_description = "You are a capable assistant responsible for coordinating specialized agents and tools to address user queries effectively."
 
-system_prompt="\n".join(system_prompt_tuple)
+agents = [
+    {
+        "name": "Customer Agent",
+        "description": "Retrieves customer profiles, feedback, and support tickets.",
+        "obj": customer_agent
+    },
+    {
+        "name": "Report Agent",
+        "description": "Provides KPI metrics such as revenue, churn, and new user count.",
+        "obj": report_agent
+    },
+    {
+        "name": "Humor Agent",
+        "description": "Delivers jokes in categories like Programming, Dark, Pun, and more.",
+        "obj": humor_agent
+    },
+    {
+        "name": "Math Agent",
+        "description": "Solves math problems, evaluates expressions, handles statistics, and interprets natural language math like 'What is five plus two?' or 'Solve exp(-x) = x'.",
+        "obj": math_agent
+    }
+]
+
+usage_rules = [
+    "Use agents strictly within their defined scope. Do not invent or extend capabilities.",
+    "If a request is ambiguous or outside agent scope, ask the user for clarification before proceeding.",
+    "If an agent fails or returns an error, explain the issue and suggest alternatives or next steps."
+]
+
+communication_principles = [
+    "Be concise, structured, and polite.",
+    "Use bullet points for lists.",
+    "Use labeled sections for structured data (e.g., `Customer Info:`, `KPI Report:`).",
+    "Provide short summaries when multiple steps are involved.",
+    "If you don’t know something, respond with 'I don't know.'",
+    "Ask specific questions to clarify unclear requests.",
+    "When helpful, present relevant options, steps, or tools in an easy-to-read format."
+]
+
+system_prompt = generate_system_prompt(
+    role_description=role_description,
+    agents=agents,
+    usage_rules=usage_rules,
+    communication_principles=communication_principles
+)
 
 supervisor = create_supervisor(
     model=llm_model, 
     prompt=system_prompt,
-    agents=agents,
+    agents=list(map(lambda agent_obj: agent_obj['obj'], agents)),
     tools=tools
 ).compile()

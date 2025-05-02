@@ -50,10 +50,10 @@ def process_query_result(result):
     # Return filtered responses and token usage
     return {
         "content": filtered_responses[-1].get("content"),
-        "steps": filtered_responses,
         "token_usage": {
             "input_tokens": total_input,
             "output_tokens": total_output,
             "total_tokens": total_tokens
-        }
+        },
+        "steps": filtered_responses
     }

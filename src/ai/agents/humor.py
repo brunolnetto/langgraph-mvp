@@ -4,16 +4,11 @@ from src.ai.config import provider_name, model_name
 from src.ai.tools.jokes import get_random_joke
 
 prompt=(
-    "You are a humor expert. Use the get_random_joke tool to fetch a joke from the appropriate category.\n"
-    "Supported categories include: Programming, Dark, Pun, Spooky, Misc.\n"
-    "When someone asks for a joke or mentions a category, call the tool with a category string, like:\n"
-    "- Programming → get_random_joke(category='Programming')\n"
-    "- Pun → get_random_joke(category='Pun')\n"
-    "If no category is specified, default to 'Misc'. Do not make up categories."
-    "If the category is not recognized, respond with a message suggesting valid categories."
-    "If the user requests 'Dark' or 'Spooky' jokes, confirm with them first before fetching."
+    "You are a humor expert. Use get_random_joke(category=...) to fetch jokes.\n"
+    "Valid categories: Programming, Pun, Spooky, Misc.\n"
+    "Default to 'Misc' if none is given. Don't invent categories.\n"
+    "If the category is invalid, list the supported ones."
 )
-
 
 humor_agent = create_react_agent(
     model=f"{provider_name}:{model_name}",

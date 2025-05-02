@@ -1,13 +1,9 @@
-from typing import Annotated
+from typing import Annotated, Sequence, TypedDict, List, Dict, Tuple
 
 from langgraph.config import RunnableConfig
-from langgraph.prebuilt import InjectedStore
 from langgraph.store.base import BaseStore
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
-
-from typing import Annotated, Sequence, TypedDict
-
 
 class AgentState(TypedDict):
     # The add_messages function defines how an update should be processed
@@ -31,14 +27,6 @@ def collect_graph_states(graph, inputs, config=None):
         states.append(state)
     return states
 
-def save_memory(memory: str, *, config: RunnableConfig, store: Annotated[BaseStore, InjectedStore()]) -> str:
-    '''Save the given memory for the current user.'''
-    # This is a **tool** the model can use to save memories to storage
-    user_id = config.get("configurable", {}).get("user_id")
-    namespace = ("memories", user_id)
-    store.put(namespace, f"memory_{len(store.search(namespace))}", {"data": memory})
-    return f"Saved memory: {memory}"
-
 def prepare_model_inputs(
     initial_prompt: str,
     state: AgentState, 
@@ -52,3 +40,51 @@ def prepare_model_inputs(
     memories = [m.value["data"] for m in store.search(namespace)]
     system_msg = f"{initial_prompt}. User memories: {', '.join(memories)}"
     return [{"role": "system", "content": system_msg}] + state["messages"]
+
+def generate_system_prompt(
+    role_description: str,
+    agents: List[Dict[str, str]],
+    usage_rules: List[str],
+    communication_principles: List[str],
+    format: str = "full"
+) -> Tuple[str, ...]:
+    """
+    Generates a tuple for use as a system prompt, optionally compacted to save tokens.
+
+    Args:
+        role_description (str): A sentence describing the assistant's overarching role.
+        agents (List[Dict[str, str]]): Each dict should contain 'name' and 'description'.
+        usage_rules (List[str]): Rules about how to interact with agents.
+        communication_principles (List[str]): Guidelines for formatting and tone.
+        format (str): If 'compact', reduces verbosity. Default is 'full'.
+
+    Returns:
+        Tuple[str, ...]: A structured prompt ready for use in language model system instructions.
+    """
+
+    if format not in {"full", "compact"}:
+        raise ValueError("format must be either 'full' or 'compact'")
+
+    lines = []
+
+    # Role description
+    lines.append(role_description.strip())
+
+    # Agents
+    lines.append("Agents available:")
+    for agent in agents:
+        name = agent['name']
+        description = agent['description']
+        lines.append(f"- {name}: {description}" if format == "compact" else f"- **{name}**: {description}")
+
+    # Usage rules
+    lines.append("Usage rules:")
+    for rule in usage_rules:
+        lines.append(f"- {rule}")
+
+    # Communication principles
+    lines.append("Communication principles:")
+    for principle in communication_principles:
+        lines.append(f"- {principle}")
+
+    return "\n".join(tuple(lines))
