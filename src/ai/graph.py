@@ -8,12 +8,18 @@ from src.ai.agents.supervisor import supervisor
 class GraphState(TypedDict):
     messages: list
     next: str
+    status: str
 
+def error_handler(state: GraphState) -> GraphState:
+    return {
+        "messages": state["messages"] + ["⚠️ Something went wrong."],
+        "next": "supervisor"
+    }
 
 # Crie o fluxo de trabalho com StateGraph
 workflow = StateGraph(GraphState)
 
-# Adicione o nó do supervisor
+# FLow with error
 workflow.add_node("supervisor", supervisor)
 
 # Defina o ponto de entrada
