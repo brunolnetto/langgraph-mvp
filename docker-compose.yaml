@@ -1,4 +1,10 @@
 services:
+  init:
+    build: .
+    container_name: retail_data_init
+    command: ["python", "generate_data.py"]
+    volumes:
+      - data:/app/data
   app:
     build: .
     container_name: langgraph_app
@@ -7,7 +13,9 @@ services:
     env_file:
       - .env
     volumes:
-      - .:/app
+      - data:/app/data
+    depends_on:
+      - init
     healthcheck:
       test: ["CMD", "curl", "-f", "localhost:8000/healthcheck"]
       interval: 30s
