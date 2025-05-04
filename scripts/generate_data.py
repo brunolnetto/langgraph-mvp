@@ -21,7 +21,7 @@ import numpy as np
 import duckdb
 from boto3 import client as boto_client
 from gcsfs import GCSFileSystem
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from faker import Faker
 from dateutil.relativedelta import relativedelta
 import math
@@ -209,15 +209,61 @@ class JSONLSink:
                 for row in df.iter_rows(named=True):
                     f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-class SQLSink:
+class MySQLSink:
     def __init__(self, db_url: str):
+        self.db_url = db_url
         self.engine = create_engine(db_url, future=True)
 
-    def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None) -> None:
+    def write(
+        self,
+        data: Dict[str, pl.DataFrame],
+        database: Optional[str] = None,
+        schema: Optional[str] = None,  # unused
+    ) -> None:
         with self.engine.begin() as conn:
+            if database:
+                try:
+                    logger.info(f"🛠️ Creating database `{database}` if not exists...")
+                    conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{database}`"))
+                    conn.execute(text(f"USE `{database}`"))
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not ensure database `{database}` exists: {e}")
+            else:
+                logger.warning("⚠️ No database provided — writing to current/default database.")
+
             for name, df in data.items():
-                table_name = f"{destination}.{name}" if destination else name
-                df.write_database(table_name=table_name, connection=conn, if_exists="replace")
+                try:
+                    logger.info(f"📥 Writing table `{name}` to MySQL...")
+                    df.write_database(table_name=name, connection=conn, if_exists="replace")
+                except Exception as e:
+                    logger.error(f"❌ Failed to write table `{name}` to MySQL: {e}")
+
+class PostgreSQLSink:
+    def __init__(self, db_url: str):
+        self.db_url = db_url
+        self.engine = create_engine(db_url, future=True)
+
+    def write(
+        self,
+        data: Dict[str, pl.DataFrame],
+        database: Optional[str] = None,  # unused
+        schema: Optional[str] = None
+    ) -> None:
+        with self.engine.begin() as conn:
+            if schema:
+                try:
+                    logger.info(f"🛠️ Creating schema `{schema}` if not exists...")
+                    conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS \"{schema}\""))
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not ensure schema `{schema}` exists: {e}")
+
+            for name, df in data.items():
+                table_name = f"{schema}.{name}" if schema else name
+                try:
+                    logger.info(f"📥 Writing table `{table_name}` to PostgreSQL...")
+                    df.write_database(table_name=table_name, connection=conn, if_exists="replace")
+                except Exception as e:
+                    logger.error(f"❌ Failed to write table `{table_name}` to PostgreSQL: {e}")
 
 class FeatherSink:
     def __init__(self, base_path: str):
@@ -321,8 +367,8 @@ class RetailDataGenerator:
         # DBs
         "duckdb": lambda path, gen: DuckDBSink(path),
         "sqlite": lambda path, gen: SQLiteSink(path),
-        "postgresql": lambda uri, gen: SQLSink(uri),
-        "mysql": lambda uri, gen: SQLSink(uri),
+        "postgresql": lambda uri, gen: PostgreSQLSink(uri),
+        "mysql": lambda uri, gen: MySQLSink(uri),
 
         # Local files
         "parquet": lambda path, gen: ParquetSink(path, compression=gen.spec.parquet_compression),
@@ -651,7 +697,6 @@ class RetailDataGenerator:
         total_elapsed = perf_counter() - start_total
         logger.info(f"✅ All metrics computed in {total_elapsed:.2f}s")
         return results
-
 
     def _customer_metrics(self, data: Dict[str, pl.DataFrame]) -> pl.DataFrame:
         tx = data['transactions']
