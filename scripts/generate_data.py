@@ -1,25 +1,29 @@
+import io
 import os
 import random
+import json
 import logging
+from urllib.parse import urlparse
+import argparse
 from datetime import date, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Tuple, List, Protocol, Type, Set
+from typing import Optional, Dict, Tuple, List, Protocol, Callable
 from concurrent.futures import ThreadPoolExecutor
 
 import polars as pl
 import duckdb
+import boto3
+from gcsfs import GCSFileSystem
 from sqlalchemy import create_engine
 from faker import Faker
 from dateutil.relativedelta import relativedelta
+import math
 
 logger = logging.getLogger("retail_gen")
 logger.setLevel(logging.INFO)
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 
-# ----------------------------
-# Config & Validation
-# ----------------------------
 @dataclass
 class RetailDataSpec:
     num_customers: int = 100
@@ -30,213 +34,36 @@ class RetailDataSpec:
     data_end: str = 'today'
     seed: Optional[int] = None
     destination: str = field(default_factory=lambda: os.getenv('RETAIL_DESTINATION', './data'))
-
     parquet_compression: Optional[str] = None
-
-    categories: List[str] = field(default_factory=lambda: [
-        'Electronics', 'Clothing', 'Home & Kitchen', 'Books', 'Sports'
-    ])
-    subcategories: Dict[str, List[str]] = field(default_factory=lambda: {
-        'Electronics': ['Mobile', 'TV', 'Audio', 'Computer'],
-        'Clothing': ['Men', 'Women', 'Kids'],
-        'Home & Kitchen': ['Furniture', 'Cookware', 'Decor'],
-        'Books': ['Fiction', 'Non-Fiction', 'Academic'],
-        'Sports': ['Outdoor', 'Gym', 'Team Sports']
-    })
-    brands: List[str] = field(default_factory=lambda: [
-        'Acme', 'Globex', 'Soylent', 'Initech', 'Umbrella'
-    ])
-    channels: List[str] = field(default_factory=lambda: ['online', 'in_store', 'marketplace'])
-    store_lat_range: Tuple[float, float] = (-23.7, -23.5)
-    store_lng_range: Tuple[float, float] = (-46.7, -46.5)
-    customer_jitter: float = 0.02
-    markup_range: Tuple[float, float] = (1.2, 2.0)
+    suppliers_per_product: int = 2
+    return_prob: float = 0.05
+    disruption_prob: float = 0.1
+    disruption_duration_days: Tuple[int, int] = (3, 10)
     initial_stock_range: Tuple[int, int] = (20, 200)
     reorder_point: int = 10
     reorder_quantity: int = 100
     reorder_lead_time_days: Tuple[int, int] = (1, 5)
 
     def __post_init__(self):
-        assert self.num_customers > 0, "num_customers must be > 0"
-        assert self.num_products > 0, "num_products must be > 0"
-        assert self.num_transactions > 0, "num_transactions must be > 0"
-        assert self.num_stores > 0, "num_stores must be > 0"
-        assert self.store_lat_range[0] < self.store_lat_range[1], "Invalid latitude range"
-        assert self.store_lng_range[0] < self.store_lng_range[1], "Invalid longitude range"
-
-
-# ----------------------------
-# Utilities
-# ----------------------------
-def seed_everything(seed: Optional[int]) -> None:
-    if seed is not None:
-        random.seed(seed)
-        Faker.seed(seed)
-
-def fake_instance(seed: Optional[int]) -> Faker:
-    return Faker() if seed is None else Faker(seed)
-
-def parse_relative_date(relative_str: str) -> date:
-    if relative_str == 'today':
-        return date.today()
-    elif relative_str.endswith('y'):
-        years = int(relative_str[:-1])
-        return date.today() + relativedelta(years=years)
-    elif relative_str.endswith('d'):
-        days = int(relative_str[:-1])
-        return date.today() + timedelta(days=days)
-    raise ValueError(f"Unsupported relative date format: {relative_str}")
-
-# ----------------------------
-# Data Generators
-# ----------------------------
-def gen_customers(spec: RetailDataSpec, fake: Faker) -> pl.DataFrame:
-    lat_min, lat_max = spec.store_lat_range
-    lng_min, lng_max = spec.store_lng_range
-    jitter = spec.customer_jitter
-    start = parse_relative_date(spec.reg_date_start)
-    end = parse_relative_date(spec.data_end)
-    data = [
-        {
-            'customer_id': fake.uuid4(),
-            'name': fake.name(),
-            'email': fake.email(),
-            'phone': fake.phone_number(),
-            'address': fake.address().replace("\n", ", "),
-            'registration_date': fake.date_between(start, end),
-            'latitude': round(random.uniform(lat_min, lat_max) + random.uniform(-jitter, jitter), 6),
-            'longitude': round(random.uniform(lng_min, lng_max) + random.uniform(-jitter, jitter), 6)
-        } for _ in range(spec.num_customers)
-    ]
-    return pl.DataFrame(data)
-
-def gen_stores(spec: RetailDataSpec, fake: Faker) -> pl.DataFrame:
-    lat_min, lat_max = spec.store_lat_range
-    lng_min, lng_max = spec.store_lng_range
-    data = [
-        {
-            'store_id': fake.uuid4(),
-            'name': f"{fake.city()} {fake.company_suffix()}",
-            'address': fake.address().replace("\n", ", "),
-            'latitude': round(random.uniform(lat_min, lat_max), 6),
-            'longitude': round(random.uniform(lng_min, lng_max), 6)
-        } for _ in range(spec.num_stores)
-    ]
-    return pl.DataFrame(data)
-
-def gen_products(spec: RetailDataSpec, fake: Faker) -> pl.DataFrame:
-    cats = spec.categories
-    subs = spec.subcategories
-    brands = spec.brands
-    mmin, mmax = spec.markup_range
-    data = []
-    for _ in range(spec.num_products):
-        cat = random.choice(cats)
-        price = round(random.uniform(5.0, 1000.0), 2)
-        cost = round(price / random.uniform(mmin, mmax), 2)
-        data.append({
-            'product_id': fake.uuid4(),
-            'category': cat,
-            'subcategory': random.choice(subs[cat]),
-            'brand': random.choice(brands),
-            'price': price,
-            'cost_price': cost
-        })
-    return pl.DataFrame(data)
-
-def gen_transactions(spec: RetailDataSpec, customers, stores, products, fake: Faker) -> pl.DataFrame:
-    cust_list, store_list, prod_list = customers.to_dicts(), stores.to_dicts(), products.to_dicts()
-    chans = spec.channels
-    end = parse_relative_date(spec.data_end)
-    data = []
-    def create_txn():
-        c, s, p = random.choice(cust_list), random.choice(store_list), random.choice(prod_list)
-        q = random.randint(1, 10)
-        tp, ct = round(p['price'] * q, 2), round(p['cost_price'] * q, 2)
-        prof = round(tp - ct, 2)
-        ch = random.choice(chans)
-        ship = round(q * random.uniform(1.0, 5.0), 2) if ch == 'online' else 0.0
-        return {
-            'transaction_id': fake.uuid4(),
-            'customer_id': c['customer_id'],
-            'store_id': s['store_id'],
-            'product_id': p['product_id'],
-            'quantity': q,
-            'total_price': tp,
-            'cost_total': ct,
-            'profit': prof,
-            'channel': ch,
-            'shipping_cost': ship,
-            'transaction_date': fake.date_between(c['registration_date'], end)
-        }
-    with ThreadPoolExecutor() as executor:
-        data = list(executor.map(lambda _: create_txn(), range(spec.num_transactions)))
-    return pl.DataFrame(data)
-
-
-def simulate_inventory(
-    transactions: pl.DataFrame,
-    spec: RetailDataSpec,
-    products: pl.DataFrame,
-    stores: pl.DataFrame
-) -> pl.DataFrame:
-    
-    initial_stock = {
-        (p["product_id"], s["store_id"]): random.randint(*spec.initial_stock_range)
-        for p in products.to_dicts()
-        for s in stores.to_dicts()
-    }
-
-    txns = sorted(transactions.to_dicts(), key=lambda x: x["transaction_date"])
-    pending_orders: List[Dict] = []
-    reorder_index: Set[Tuple[str, str]] = set()
-
-    enriched = []
-    stock = initial_stock.copy()
-
-    for txn in txns:
-        key = (txn["product_id"], txn["store_id"])
-        date = txn["transaction_date"]
-
-        # Processar pedidos pendentes com chegada nesta data ou anterior
-        arrivals_today = [r for r in pending_orders if r["arrival_date"] <= date and (r["product_id"], r["store_id"]) == key]
-        for r in arrivals_today:
-            stock[key] += r["quantity"]
-            pending_orders.remove(r)
-            reorder_index.discard((r["product_id"], r["store_id"]))
-
-        before_stock = stock[key]
-        after_stock = max(before_stock - txn["quantity"], 0)
-
-        txn["stock_before"] = before_stock
-        txn["stock_after"] = after_stock
-        stock[key] = after_stock
-
-        # Gatilho de reposição
-        if after_stock <= spec.reorder_point and key not in reorder_index:
-            lead_time = random.randint(*spec.reorder_lead_time_days)
-            arrival_date = date + timedelta(days=lead_time)
-            reorder = {
-                "product_id": key[0],
-                "store_id": key[1],
-                "arrival_date": arrival_date,
-                "quantity": spec.reorder_quantity
-            }
-            pending_orders.append(reorder)
-            reorder_index.add(key)
-            txn["reorder_placed"] = True
-        else:
-            txn["reorder_placed"] = False
-
-        enriched.append(txn)
-
-    return pl.DataFrame(enriched)
+        assert self.num_customers > 0
+        assert self.num_products > 0
+        assert self.num_transactions > 0
+        assert self.num_stores > 0
 
 # ----------------------------
 # Storage Layer
 # ----------------------------
 class DataSink(Protocol):
     def write(self, data: Dict[str, pl.DataFrame]): ...
+
+class CSVSink:
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self.path.mkdir(parents=True, exist_ok=True)
+
+    def write(self, data: Dict[str, pl.DataFrame]):
+        for name, df in data.items():
+            df.write_csv(self.path / f"{name}.csv")
 
 class DuckDBSink:
     def __init__(self, path: str):
@@ -259,6 +86,35 @@ class SQLSink:
             for name, df in data.items():
                 df.write_database(table_name=name, connection=conn, if_exists="replace")
 
+class S3ParquetSink:
+    def __init__(self, bucket: str, prefix: str, compression: str = "snappy"):
+        self.bucket = bucket
+        self.prefix = prefix.rstrip("/") + "/"
+        self.compression = compression
+        self.s3 = boto3.client("s3")
+
+    def write(self, data: Dict[str, pl.DataFrame]):
+        
+        for name, df in data.items():
+            buf = io.BytesIO()
+            df.write_parquet(buf, compression=self.compression)
+            key = f"{self.prefix}{name}.parquet"
+            buf.seek(0)
+            self.s3.upload_fileobj(buf, self.bucket, key)
+
+class GCSParquetSink:
+    def __init__(self, path: str, compression: str = "snappy"):
+        
+        self.fs = GCSFileSystem()
+        self.path = path.rstrip("/") + "/"
+        self.compression = compression
+
+    def write(self, data: Dict[str, pl.DataFrame]):
+        for name, df in data.items():
+            full_path = f"{self.path}{name}.parquet"
+            with self.fs.open(full_path, "wb") as f:
+                df.write_parquet(f, compression=self.compression)
+
 class ParquetSink:
     def __init__(self, path: str, compression: Optional[str] = None):
         self.path = Path(path)
@@ -269,65 +125,337 @@ class ParquetSink:
         for name, df in data.items():
             df.write_parquet(self.path / f"{name}.parquet", compression=self.compression)
 
-SINK_REGISTRY: Dict[str, Type[DataSink]] = {
-    'duckdb': DuckDBSink,
-    'parquet': ParquetSink,
-    'sql': SQLSink
-}
+class JSONLSink:
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self.path.mkdir(parents=True, exist_ok=True)
 
-# ----------------------------
-# Orchestrator
-# ----------------------------
-def generate_retail_data(spec: RetailDataSpec) -> Dict[str, pl.DataFrame]:
-    seed_everything(spec.seed)
-    fake = fake_instance(spec.seed)
-    customers = gen_customers(spec, fake)
-    stores = gen_stores(spec, fake)
-    products = gen_products(spec, fake)
-    transactions = gen_transactions(spec, customers, stores, products, fake)
-    inventory = simulate_inventory(transactions, spec, products, stores)
-    return {
-        'customers': customers,
-        'stores': stores,
-        'products': products,
-        'transactions': transactions,
-        'inventory': inventory
+    def write(self, data: Dict[str, pl.DataFrame]):
+        for name, df in data.items():
+            with open(self.path / f"{name}.jsonl", "w", encoding="utf-8") as f:
+                for row in df.iter_rows(named=True):
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+class FeatherSink:
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self.path.mkdir(parents=True, exist_ok=True)
+
+    def write(self, data: Dict[str, pl.DataFrame]):
+        for name, df in data.items():
+            df.write_ipc(self.path / f"{name}.feather")  # .feather é .ipc
+
+class InMemorySink:
+    def __init__(self):
+        self.storage = {}
+
+    def write(self, data: Dict[str, pl.DataFrame]):
+        self.storage.update(data)
+
+class SQLiteSink:
+    def __init__(self, db_path: str):
+        self.engine = create_engine(f"sqlite:///{db_path}", future=True)
+
+    def write(self, data: Dict[str, pl.DataFrame]):
+        with self.engine.begin() as conn:
+            for name, df in data.items():
+                df.write_database(table_name=name, connection=conn, if_exists="replace")
+
+
+class RetailDataGenerator:
+    _SINK_REGISTRY: Dict[str, Callable[[str, "RetailDataGenerator"], DataSink]] = {
+        # DBs
+        "duckdb": lambda path, gen: DuckDBSink(path),
+        "sqlite": lambda path, gen: SQLiteSink(path),
+        "postgresql": lambda uri, gen: SQLSink(uri),
+        "mysql": lambda uri, gen: SQLSink(uri),
+
+        # Arquivos locais
+        "parquet": lambda path, gen: ParquetSink(path, compression=gen.spec.parquet_compression),
+        "csv": lambda path, gen: CSVSink(path),
+        "jsonl": lambda path, gen: JSONLSink(path),
+        "feather": lambda path, gen: FeatherSink(path),
+
+        # Nuvem
+        "s3": lambda uri, gen: S3ParquetSink(
+            bucket=uri.split("/")[2],  # s3://bucket/key/...
+            prefix="/".join(uri.split("/")[3:]),
+            compression=gen.spec.parquet_compression or "snappy"
+        ),
+        "gcs": lambda uri, gen: GCSParquetSink(
+            path=uri, compression=gen.spec.parquet_compression or "snappy"
+        ),
+
+        # Fallback
+        "file": lambda path, gen: ParquetSink(path, compression=gen.spec.parquet_compression),
     }
 
-def populate_retail_sinks(spec: RetailDataSpec, data: Dict[str, pl.DataFrame]) -> None:
-    dest = spec.destination
+        
+    def __init__(self, spec: RetailDataSpec):
+        self.spec = spec
+        seed = spec.seed
 
-    if dest.startswith('duckdb://'):
-        logger.info(f"🦆 Writing data to DuckDB at {dest}...")
-        SINK_REGISTRY['duckdb'](dest.replace('duckdb://', '')).write(data)
-    elif dest.startswith(('postgresql://', 'mysql://', 'mysql+pymysql://')):
-        logger.info(f"🛢️ Writing data to SQL database at {dest}...")
-        SINK_REGISTRY['sql'](dest).write(data)
-    else:
-        logger.info(f"📁 Writing data to Parquet files at {dest}...")
-        SINK_REGISTRY['parquet'](dest, compression=spec.parquet_compression).write(data)
+        random.seed(seed)
+        Faker.seed(seed)
+        
+        self.fake = Faker(seed) if seed is not None else Faker()
 
-def synthetic_retail_data_pipeline(spec: RetailDataSpec) -> Dict[str, pl.DataFrame]:
-    logger.info("🛒 Generating synthetic retail data...")
-    data = generate_retail_data(spec)
-    
-    db_url = os.getenv('RETAIL_DB_URL', '')
-    logger.info(f"📦 Populating data sink {db_url}...")
-    populate_retail_sinks(spec, data)
-    
-    logger.info("✅ Synthetic retail data generation complete.")
-    return data
+    # Utility
+    @staticmethod
+    def parse_date(rel: str) -> date:
+        if rel == 'today': return date.today()
+        if rel.endswith('y'):
+            return date.today() + relativedelta(years=int(rel[:-1]))
+        if rel.endswith('d'):
+            return date.today() + timedelta(days=int(rel[:-1]))
+        raise ValueError("Invalid date str")
 
+    @staticmethod
+    def haversine(lat1, lon1, lat2, lon2):
+        R=6371; dlat=math.radians(lat2-lat1); dlon=math.radians(lon2-lon1)
+        a=math.sin(dlat/2)**2+math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
+        return R*2*math.asin(math.sqrt(a))
 
-# ----------------------------
-# Main Function
-# ----------------------------
-if __name__ == '__main__':
-    spec = RetailDataSpec(
-        num_customers=500,
-        num_products=200,
-        num_transactions=2000,
-        num_stores=10,
-        seed=42
+    def gen_customers(self) -> pl.DataFrame:
+        s, e = self.parse_date(self.spec.reg_date_start), self.parse_date(self.spec.data_end)
+        data=[]
+        for _ in range(self.spec.num_customers):
+            reg=self.fake.date_between(s,e)
+            lat=random.uniform(*self.spec.initial_stock_range)
+            data.append({
+                'customer_id': self.fake.uuid4(),
+                'registration_date': reg,
+                'age': random.randint(18,80),
+                'income': random.choice(['low','medium','high']),
+                'channel_pref': random.choice(['online','in_store','marketplace']),
+                'latitude': round(random.uniform(*self.spec.initial_stock_range),6),
+                'longitude': round(random.uniform(*self.spec.initial_stock_range),6)
+            })
+        return pl.DataFrame(data)
+
+    def gen_stores(self) -> pl.DataFrame:
+        data=[]
+        for _ in range(self.spec.num_stores):
+            data.append({'store_id': self.fake.uuid4(),
+                         'latitude': round(random.uniform(*self.spec.initial_stock_range),6),
+                         'longitude': round(random.uniform(*self.spec.initial_stock_range),6)})
+        return pl.DataFrame(data)
+
+    def gen_products(self) -> Tuple[pl.DataFrame, Dict[str,List[Dict]]]:
+        prods=[]; suppliers={}
+        for _ in range(self.spec.num_products):
+            pid=self.fake.uuid4()
+            prods.append({'product_id':pid,'price':round(random.uniform(5,1000),2)})
+            sups=[]
+            for _ in range(self.spec.suppliers_per_product):
+                sups.append({'sla': random.randint(*self.spec.reorder_lead_time_days)})
+            suppliers[pid]=sups
+        return pl.DataFrame(prods), suppliers
+
+    def gen_transactions(
+        self, 
+        customers: pl.DataFrame, 
+        stores: pl.DataFrame, 
+        products: pl.DataFrame, 
+        suppliers: Dict[str, List[Dict]]
+    ) -> pl.DataFrame:
+        custs = customers.to_dicts()
+        stores_map = {s['store_id']: s for s in stores.to_dicts()}
+        prods = products.to_dicts()
+        store_ids = list(stores_map.keys())
+        rec = []
+        end = self.parse_date(self.spec.data_end)
+        for c in custs:
+            for _ in range(random.randint(1, 8)):
+                pid = random.choice(prods)['product_id']
+                sid = random.choice(store_ids)
+                txn_date = self.fake.date_between(c['registration_date'], end)
+                qty = random.randint(1, 5)
+                price = next(p['price'] for p in prods if p['product_id'] == pid) * qty
+                dist = self.haversine(
+                    c['latitude'], c['longitude'],
+                    stores_map[sid]['latitude'], stores_map[sid]['longitude']
+                )
+                txn = {
+                    'customer_id': c['customer_id'],
+                    'product_id': pid,
+                    'store_id': sid,
+                    'quantity': qty,
+                    'total_price': price,
+                    'transaction_date': txn_date,
+                    'distance_km': round(dist, 2)
+                }
+                # returns
+                if random.random() < self.spec.return_prob:
+                    return_date = txn_date + timedelta(days=random.randint(1, 30))
+                    txn['returned'] = True
+                    txn['return_date'] = return_date
+                else:
+                    txn['returned'] = False
+                    txn['return_date'] = None
+                rec.append(txn)
+        return pl.DataFrame(rec)
+
+    def simulate_inventory(
+        self, 
+        transactions: pl.DataFrame, 
+        suppliers: Dict[str, List[Dict]]
+    ) -> pl.DataFrame:
+        stock = {}
+        metrics = []
+        # inicializa estoque por loja-produto
+        for row in transactions.select(['product_id','store_id']).unique().to_dicts():
+            stock[(row['product_id'], row['store_id'])] = random.randint(*self.spec.initial_stock_range)
+        # processa transações cronologicamente
+        for txn in sorted(transactions.to_dicts(), key=lambda x: x['transaction_date']):
+            key = (txn['product_id'], txn['store_id'])
+            before = stock[key]
+            sold = min(before, txn['quantity'])
+            stock[key] = before - sold
+            # reposição de estoque se abaixo do ponto de reorder
+            if stock[key] <= self.spec.reorder_point:
+                sup = random.choice(suppliers[txn['product_id']])
+                lead = sup['sla']
+                if random.random() < self.spec.disruption_prob:
+                    lead += random.randint(*self.spec.disruption_duration_days)
+                arrival_date = txn['transaction_date'] + timedelta(days=lead)
+                # atualização imediata; em simulação real, considerar pending orders
+                stock[key] += self.spec.reorder_quantity
+            metrics.append({**txn, 'stock_before': before, 'stock_after': stock[key]})
+        return pl.DataFrame(metrics)
+
+    def compute_metrics(self, data: Dict[str, pl.DataFrame]) -> Dict[str, pl.DataFrame]:
+        tx = data['transactions']
+        inv = data['inventory']
+        
+        # Clientes não retornados
+        df = tx.filter(pl.col('returned') == False)
+        
+        # Frequência e monetário
+        freq = df.group_by('customer_id').len().rename({'len': 'frequency'})
+        rec = df.group_by('customer_id').agg(pl.max('transaction_date').alias('last_date'))
+        mon = df.group_by('customer_id').agg(pl.sum('total_price').alias('monetary'))
+        
+        # Recência
+        today = date.today()
+        last_dates = rec['last_date'].to_list()
+        recency_list = [(today - d).days for d in last_dates]
+        rec = rec.with_columns(pl.Series('recency_days', recency_list))
+        cm = freq.join(rec, on='customer_id').join(mon, on='customer_id')
+
+        # Métricas de loja: vendas e perdidos
+        sold = inv.group_by('store_id').agg(pl.sum('quantity').alias('total_sold'))
+        lost_amount = [(row['quantity'] - row['stock_after']) for row in inv.to_dicts()]
+
+        lost_df = pl.DataFrame(inv.to_dicts()).with_columns(pl.Series('lost_sales', lost_amount))
+        lost = lost_df.group_by('store_id').agg(pl.sum('lost_sales').alias('lost_sales'))
+        sm = sold.join(lost, on='store_id')
+        
+        return {
+            'customer_metrics': cm, 
+            'store_metrics': sm
+        }
+
+    def write(self, uri: str, data: Dict[str, pl.DataFrame]):
+        parsed = urlparse(uri)
+        scheme = parsed.scheme or "file"
+        path = uri.replace(f"{scheme}://", "", 1)
+
+        factory = self._SINK_REGISTRY.get(scheme)
+        if not factory:
+            raise ValueError(f"Unsupported storage scheme: '{scheme}'")
+
+        sink = factory(path if scheme != "postgresql" else uri, self)
+        sink.write(data)
+
+    def generate_retail_data(self) -> Dict[str, pl.DataFrame]:
+        cust=self.gen_customers(); 
+        stores=self.gen_stores(); 
+        prods, sup=self.gen_products()
+        tx = self.gen_transactions(cust, stores, prods, sup)
+        inv = self.simulate_inventory(tx, sup)
+        
+        return {
+            'customers':cust,
+            'stores':stores,
+            'products':prods,
+            'transactions':tx,
+            'inventory':inv
+        }
+
+    def run(self) -> Dict[str,pl.DataFrame]:
+        try:
+            logger.info("🛒 Generating retail data...")
+            retail_data = self.generate_retail_data()
+        except Exception as e:
+            logger.error(f"❌ Error generating retail data: {e}")
+            raise
+
+        try:
+            logger.info("📊 Generating retail metrics...")
+            metrics = self.compute_metrics(retail_data)
+        except Exception as e:
+            logger.error(f"❌ Error computing retail metrics: {e}")
+            raise
+
+        try:
+            logger.info("🧩 Updating data with metrics...")
+            retail_data.update(metrics)
+        except Exception as e:
+            logger.error(f"❌ Error updating data with metrics: {e}")
+            raise
+
+        try:
+            logger.info("📦 Populating data sink...")
+            self.write(self.spec.destination, retail_data)
+        except Exception as e:
+            logger.error(f"❌ Error populating data sink: {e}")
+            raise
+
+        logger.info("✅ Synthetic retail data generation complete!")
+        return retail_data
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate synthetic retail data and metrics.")
+    parser.add_argument(
+        "--num_customers", type=int, default=500, 
+        help="Number of customers to generate"
     )
-    synthetic_retail_data_pipeline(spec)
+    parser.add_argument(
+        "--num_products", type=int, default=2000, 
+        help="Number of products to generate"
+    )
+    parser.add_argument(
+        "--num_transactions", type=int, default=10000, 
+        help="Number of transactions to generate"
+    )
+    parser.add_argument(
+        "--num_stores", type=int, default=10, 
+        help="Number of stores to generate"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, 
+        help="Random seed for reproducibility"
+    )
+    parser.add_argument(
+        "--destination", type=str,  default='duckdb://data/retail.db', 
+        help="Data sink URI (e.g. duckdb://data.db or ./data)"
+    )
+    args = parser.parse_args()
+
+    # Build spec from CLI args
+    spec = RetailDataSpec(
+        num_customers=args.num_customers,
+        num_products=args.num_products,
+        num_transactions=args.num_transactions,
+        num_stores=args.num_stores,
+        seed=args.seed,
+        destination=args.destination or RetailDataSpec().destination
+    )
+
+    # Run generator
+    gen = RetailDataGenerator(spec)
+    gen.run()
+
+if __name__ == '__main__':
+    main()
