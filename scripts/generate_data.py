@@ -2,22 +2,24 @@ import io
 import os
 import random
 import json
+from time import perf_counter
 import logging
 from urllib.parse import urlparse
+from uuid import uuid4
 import argparse
 from datetime import date, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Tuple, List, Protocol, Callable
+from typing import Union, Optional, Dict, Tuple, List, Protocol, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from collections import defaultdict
 
-
+from pydantic import BaseModel, Field
 import polars as pl
 import numpy as np
 import duckdb
-import boto3
+from boto3 import client as boto_client
 from gcsfs import GCSFileSystem
 from sqlalchemy import create_engine
 from faker import Faker
@@ -28,17 +30,16 @@ logger = logging.getLogger("retail_gen")
 logger.setLevel(logging.INFO)
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 
-@dataclass
-class GeoClusterSpec:
+class GeoClusterSpec(BaseModel):
     name: str
     lat: float
     lon: float
     radius_km: int
     num_stores: int
     weight: float
-    channel_weights: Optional[Dict[str, float]] = None
-    income_dist: Optional[Dict[str, float]] = None
-    age_range: Optional[List[int]] = None
+    channel_weights: Dict[str, float] = Field(default_factory=lambda: {"online": 0.5, "in_store": 0.5})
+    income_dist: Dict[str, float] = Field(default_factory=lambda: {"low": 0.3, "medium": 0.5, "high": 0.2})
+    age_range: List[int] = Field(default_factory=lambda: [18, 65])
 
 @dataclass
 class RetailDataSpec:
@@ -146,188 +147,155 @@ def generate_geo_clusters(clusterization_type: str) -> List[GeoClusterSpec]:
     
     return clusters
 
+def estimate_sla_days(from_loc, to_loc, base=500, jitter=True):
+    km = haversine(from_loc, to_loc)
+    days = max(1, km // base)
+    return days + random.randint(-1, 2) if jitter else days
+
+
 # ----------------------------
 # Storage Layer
 # ----------------------------
 class DataSink(Protocol):
-    def write(self, data: Dict[str, pl.DataFrame]): ...
+    def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None) -> None:
+        ...
 
 class CSVSink:
-    def __init__(self, path: str):
-        self.path = Path(path)
-        self.path.mkdir(parents=True, exist_ok=True)
+    def __init__(self, base_path: str):
+        self.base_path = Path(base_path)
+        self.base_path.mkdir(parents=True, exist_ok=True)
 
-    def write(self, data: Dict[str, pl.DataFrame]):
+    def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None) -> None:
+        output_path = self.base_path / destination if destination else self.base_path
+        output_path.mkdir(parents=True, exist_ok=True)
         for name, df in data.items():
-            df.write_csv(self.path / f"{name}.csv")
+            df.write_csv(output_path / f"{name}.csv")
+
+class ParquetSink:
+    def __init__(self, base_path: str, compression: Optional[str] = None):
+        self.base_path = Path(base_path)
+        self.base_path.mkdir(parents=True, exist_ok=True)
+        self.compression = compression
+
+    def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None) -> None:
+        output_path = self.base_path / destination if destination else self.base_path
+        output_path.mkdir(parents=True, exist_ok=True)
+        for name, df in data.items():
+            df.write_parquet(output_path / f"{name}.parquet", compression=self.compression)
 
 class DuckDBSink:
-    def __init__(self, path: str):
-        self.path = path
+    def __init__(self, db_path: str):
+        self.db_path = db_path
 
-    def write(self, data: Dict[str, pl.DataFrame]):
-        con = duckdb.connect(self.path)
+    def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None) -> None:
+        schema_prefix = f"{destination}." if destination else ""
+        con = duckdb.connect(self.db_path)
         for name, df in data.items():
             con.register(name, df.to_arrow())
-            con.execute(f"CREATE OR REPLACE TABLE {name} AS SELECT * FROM {name}")
+            con.execute(f"CREATE OR REPLACE TABLE {schema_prefix}{name} AS SELECT * FROM {name}")
             con.unregister(name)
         con.close()
+
+class JSONLSink:
+    def __init__(self, base_path: str):
+        self.base_path = Path(base_path)
+        self.base_path.mkdir(parents=True, exist_ok=True)
+
+    def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None) -> None:
+        output_path = self.base_path / destination if destination else self.base_path
+        output_path.mkdir(parents=True, exist_ok=True)
+        for name, df in data.items():
+            with open(output_path / f"{name}.jsonl", "w", encoding="utf-8") as f:
+                for row in df.iter_rows(named=True):
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 class SQLSink:
     def __init__(self, db_url: str):
         self.engine = create_engine(db_url, future=True)
 
-    def write(self, data: Dict[str, pl.DataFrame]):
+    def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None) -> None:
         with self.engine.begin() as conn:
             for name, df in data.items():
-                df.write_database(table_name=name, connection=conn, if_exists="replace")
-
-class S3ParquetSink:
-    def __init__(self, bucket: str, prefix: str, compression: str = "snappy"):
-        self.bucket = bucket
-        self.prefix = prefix.rstrip("/") + "/"
-        self.compression = compression
-        self.s3 = boto3.client("s3")
-
-    def write(self, data: Dict[str, pl.DataFrame]):
-        
-        for name, df in data.items():
-            buf = io.BytesIO()
-            df.write_parquet(buf, compression=self.compression)
-            key = f"{self.prefix}{name}.parquet"
-            buf.seek(0)
-            self.s3.upload_fileobj(buf, self.bucket, key)
-
-class GCSParquetSink:
-    def __init__(self, path: str, compression: str = "snappy"):
-        
-        self.fs = GCSFileSystem()
-        self.path = path.rstrip("/") + "/"
-        self.compression = compression
-
-    def write(self, data: Dict[str, pl.DataFrame]):
-        for name, df in data.items():
-            full_path = f"{self.path}{name}.parquet"
-            with self.fs.open(full_path, "wb") as f:
-                df.write_parquet(f, compression=self.compression)
-
-class ParquetSink:
-    def __init__(self, path: str, compression: Optional[str] = None):
-        self.path = Path(path)
-        self.path.mkdir(parents=True, exist_ok=True)
-        self.compression = compression
-
-    def write(self, data: Dict[str, pl.DataFrame]):
-        for name, df in data.items():
-            df.write_parquet(self.path / f"{name}.parquet", compression=self.compression)
-
-class JSONLSink:
-    def __init__(self, path: str):
-        self.path = Path(path)
-        self.path.mkdir(parents=True, exist_ok=True)
-
-    def write(self, data: Dict[str, pl.DataFrame]):
-        for name, df in data.items():
-            with open(self.path / f"{name}.jsonl", "w", encoding="utf-8") as f:
-                for row in df.iter_rows(named=True):
-                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                table_name = f"{destination}.{name}" if destination else name
+                df.write_database(table_name=table_name, connection=conn, if_exists="replace")
 
 class FeatherSink:
-    def __init__(self, path: str):
-        self.path = Path(path)
-        self.path.mkdir(parents=True, exist_ok=True)
+    def __init__(self, base_path: str):
+        self.base_path = Path(base_path)
+        self.base_path.mkdir(parents=True, exist_ok=True)
 
-    def write(self, data: Dict[str, pl.DataFrame]):
+    def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None) -> None:
+        output_path = self.base_path / destination if destination else self.base_path
+        output_path.mkdir(parents=True, exist_ok=True)
         for name, df in data.items():
-            df.write_ipc(self.path / f"{name}.feather")  # .feather é .ipc
+            df.write_ipc(output_path / f"{name}.feather")
 
 class InMemorySink:
     def __init__(self):
         self.storage = {}
 
-    def write(self, data: Dict[str, pl.DataFrame]):
-        self.storage.update(data)
+    def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None) -> None:
+        key = destination or "default"
+        self.storage[key] = data
+
+class S3ParquetSink:
+    def __init__(self, bucket: str, prefix: str = '', compression: str = "snappy"):
+        self.bucket = bucket
+        self.default_prefix = prefix.rstrip("/") + "/" if prefix else ''
+        self.compression = compression
+        self.s3 = boto_client("s3")
+
+    def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None):
+        prefix = destination.rstrip("/") + "/" if destination else self.default_prefix
+        for name, df in data.items():
+            buf = io.BytesIO()
+            df.write_parquet(buf, compression=self.compression)
+            key = f"{prefix}{name}.parquet"
+            buf.seek(0)
+            self.s3.upload_fileobj(buf, self.bucket, key)
+
+class GCSParquetSink:
+    def __init__(self, path: str, compression: str = "snappy"):
+        self.default_path = path.rstrip("/") + "/" if path else ''
+        self.compression = compression
+        self.fs = GCSFileSystem()
+
+    def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None):
+        path = destination.rstrip("/") + "/" if destination else self.default_path
+        for name, df in data.items():
+            full_path = f"{path}{name}.parquet"
+            with self.fs.open(full_path, "wb") as f:
+                df.write_parquet(f, compression=self.compression)
 
 class SQLiteSink:
     def __init__(self, db_path: str):
-        self.engine = create_engine(f"sqlite:///{db_path}", future=True)
+        self.default_db_path = db_path
+        self.default_engine = create_engine(f"sqlite:///{db_path}", future=True)
 
-    def write(self, data: Dict[str, pl.DataFrame]):
-        with self.engine.begin() as conn:
+    def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None):
+        db_path = destination if destination else self.default_db_path
+        engine = create_engine(f"sqlite:///{db_path}", future=True) if destination else self.default_engine
+        with engine.begin() as conn:
             for name, df in data.items():
                 df.write_database(table_name=name, connection=conn, if_exists="replace")
 
 class GeoClusterManager:
-    def __init__(self, geo_clusters: List[dict]):
-        self.regions = {}
-        self._initialize_clusters(geo_clusters)
-    
-    def _initialize_clusters(self, geo_clusters: List[dict]):
-        """Inicializa as regiões com base nos dados fornecidos."""
-        for cluster in geo_clusters:
-            self.regions[cluster['name']] = cluster
+    def __init__(self, geo_clusters: List[GeoClusterSpec]):
+        """Initialize with a list of GeoClusterSpec instances."""
+        self.geo_clusters = {cluster.name: cluster for cluster in geo_clusters}
 
     def assign_to_region(self, latitude: float, longitude: float) -> str:
-        """Método simples para atribuir um cliente a uma região com base na proximidade."""
-        # Simulação de atribuição geográfica (não implementado de forma precisa)
-        for region_name, cluster in self.regions.items():
-            if self._is_within_radius(latitude, longitude, cluster):
-                return region_name
-        return "Unknown"
-
-    def _is_within_radius(self, lat: float, lon: float, cluster: dict) -> bool:
-        """Método simples para verificar se um ponto está dentro do raio de um cluster"""
-        # Aqui, você poderia usar algo como a fórmula de Haversine para calcular a distância
-        # entre as coordenadas e verificar se está dentro do raio do cluster.
-        return True  # Simples, para exemplo.
-
-    def get_store_coordinates(self, store_id: str):
-        """Retorna as coordenadas de uma loja baseada no store_id"""
-        # Para simplicidade, podemos retornar coordenadas fictícias
-        return (0, 0)
-
-
-class GeoClusterManager:
-    def __init__(self):
-        """
-        Define broad geo-regions like LATAM, EMEA, APAC, etc.
-        Each region contains a list of stores with their geographic coordinates.
-        """
-        self.regions = {
-            "LATAM": [
-                {'store_id': 'store_1', 'latitude': -23.5505, 'longitude': -46.6333},  # São Paulo
-                {'store_id': 'store_2', 'latitude': -34.6037, 'longitude': -58.3816},  # Buenos Aires
-                # Add more stores
-            ],
-            "EMEA": [
-                {'store_id': 'store_3', 'latitude': 51.5074, 'longitude': -0.1278},  # London
-                {'store_id': 'store_4', 'latitude': 48.8566, 'longitude': 2.3522},   # Paris
-                # Add more stores
-            ],
-            "APAC": [
-                {'store_id': 'store_5', 'latitude': 35.6762, 'longitude': 139.6503},  # Tokyo
-                {'store_id': 'store_6', 'latitude': -33.8688, 'longitude': 151.2093}, # Sydney
-                # Add more stores
-            ]
-        }
-
-    def assign_to_region(self, customer_lat, customer_lon):
-        """
-        Assign a customer to a region (LATAM, EMEA, APAC) based on the nearest store.
-        """
-        min_distance = float('inf')
-        assigned_region = None
+        """Assign a point to the nearest region within range, or fallback to nearest overall."""
+        closest_region = None
+        closest_distance = float("inf")
         
-        for region_name, region_stores in self.regions.items():
-            for store in region_stores:
-                dist = self.haversine(customer_lat, customer_lon, store['latitude'], store['longitude'])
-                if dist < min_distance:
-                    min_distance = dist
-                    assigned_region = region_name
+        for region_name, cluster in self.geo_clusters.items():
+            distance = haversine(latitude, longitude, cluster.lat, cluster.lon)
+            if distance < closest_distance:
+                closest_distance = distance
+                closest_region = region_name
         
-        return assigned_region
-
-
+        return closest_region
 
 class StockManager:
     def __init__(self, initial_stock_range: Tuple[int, int], lock: Lock):
@@ -348,7 +316,6 @@ class StockManager:
         key = (store_id, product_id)
         return self.stock[key]
 
-
 class RetailDataGenerator:
     _SINK_REGISTRY: Dict[str, Callable[[str, "RetailDataGenerator"], DataSink]] = {
         # DBs
@@ -357,13 +324,13 @@ class RetailDataGenerator:
         "postgresql": lambda uri, gen: SQLSink(uri),
         "mysql": lambda uri, gen: SQLSink(uri),
 
-        # Arquivos locais
+        # Local files
         "parquet": lambda path, gen: ParquetSink(path, compression=gen.spec.parquet_compression),
         "csv": lambda path, gen: CSVSink(path),
         "jsonl": lambda path, gen: JSONLSink(path),
         "feather": lambda path, gen: FeatherSink(path),
 
-        # Nuvem
+        # Cloud
         "s3": lambda uri, gen: S3ParquetSink(
             bucket=uri.split("/")[2],  # s3://bucket/key/...
             prefix="/".join(uri.split("/")[3:]),
@@ -377,7 +344,6 @@ class RetailDataGenerator:
         "file": lambda path, gen: ParquetSink(path, compression=gen.spec.parquet_compression),
     }
 
-        
     def __init__(self, spec: RetailDataSpec):
         self.spec = spec
         seed = spec.seed
@@ -390,37 +356,37 @@ class RetailDataGenerator:
         self.stock_manager = StockManager(self.spec.initial_stock_range, Lock())
 
     def generate_customers(self) -> pl.DataFrame:
-        start_date = self.parse_date(self.spec.reg_date_start)
-        end_date = self.parse_date(self.spec.data_end)
+        start_date = parse_date(self.spec.reg_date_start)
+        end_date = parse_date(self.spec.data_end)
 
         clusters: List[GeoClusterSpec] = self.spec.geo_clusters
         if not clusters:
             raise ValueError("❌ No geo_clusters defined in spec.")
 
-        cluster_weights = [c['weight'] for c in clusters]  # Acessando 'weight' diretamente do dicionário
+        cluster_weights = [c.weight for c in clusters]
         customers = []
 
         for _ in range(self.spec.num_customers):
             cluster = random.choices(clusters, weights=cluster_weights)[0]
 
-            lat, lon = random_geo_around(cluster['lat'], cluster['lon'], cluster['radius_km'])
+            lat, lon = random_geo_around(cluster.lat, cluster.lon, cluster.radius_km)
 
             registration = self.fake.date_between(start_date, end_date)
 
             channel = random.choices(
                 population=['online', 'in_store'],
-                weights=[cluster.get('channel_weights', {}).get('online', 0.5),
-                         cluster.get('channel_weights', {}).get('in_store', 0.5)]
+                weights=[cluster.channel_weights.get('online', 0.5),
+                         cluster.channel_weights.get('in_store', 0.5)]
             )[0]
 
             income = random.choices(
                 population=['low', 'medium', 'high'],
-                weights=[cluster.get('income_dist', {}).get('low', 0.3),
-                         cluster.get('income_dist', {}).get('medium', 0.5),
-                         cluster.get('income_dist', {}).get('high', 0.2)]
+                weights=[cluster.income_dist.get('low', 0.3),
+                         cluster.income_dist.get('medium', 0.5),
+                         cluster.income_dist.get('high', 0.2)]
             )[0]
 
-            age = random.randint(*cluster['age_range'])
+            age = random.randint(*cluster.age_range)
 
             customers.append({
                 'customer_id': self.fake.uuid4(),
@@ -430,7 +396,7 @@ class RetailDataGenerator:
                 'channel_pref': channel,
                 'latitude': round(lat, 6),
                 'longitude': round(lon, 6),
-                'region': cluster['name'],
+                'region': cluster.name,
             })
 
         logger.info(f"✅ {len(customers)} customers generated across {len(clusters)} geo clusters.")
@@ -439,20 +405,20 @@ class RetailDataGenerator:
 
     def generate_stores(self) -> pl.DataFrame:
         stores = []
-        for region in self.spec.geo_clusters:
-            for _ in range(region.num_stores):
-                lat, lon = random_geo_around(region.center_lat, region.center_lon, region.spread_km)
+        for cluster in self.spec.geo_clusters:
+            for _ in range(cluster.num_stores):
+                lat, lon = random_geo_around(cluster.lat, cluster.lon, cluster.radius_km)
                 stores.append({
                     'store_id': self.fake.uuid4(),
                     'latitude': round(lat, 6),
                     'longitude': round(lon, 6),
-                    'region': region.name
+                    'region': cluster.name
                 })
 
         logger.info(f"✅ {len(stores)} stores generated across {len(self.spec.geo_clusters)} clusters.")
         return pl.DataFrame(stores)
 
-    def generate_suppliers(self, spec: RetailDataSpec) -> List[dict]:
+    def generate_suppliers(self) -> pl.DataFrame:
         suppliers_df=pl.DataFrame([
             {
                 "supplier_id": f"supplier_{i}",
@@ -462,13 +428,16 @@ class RetailDataGenerator:
             for i in range(self.spec.supplier_pool_size)
         ])
 
-        logger.info(f"✅ {len(suppliers_df)} supliers generated.")
+        logger.info(f"✅ {len(suppliers_df)} suppliers generated.")
         
         return suppliers_df
 
-    def generate_products(self, suppliers: List[dict]) -> List[dict]:
+    def generate_products(self, suppliers: Union[List[dict], pl.DataFrame]) -> pl.DataFrame:
         categories = self.spec.product_categories
         seasonalities = self.spec.product_seasonality
+
+        if not isinstance(suppliers, list):
+            suppliers = suppliers.to_dicts()
 
         products = []
         for i in range(self.spec.num_products):
@@ -476,165 +445,319 @@ class RetailDataGenerator:
             seasonality = random.choice(seasonalities)
             product_id = f"prod_{i}"
 
-            # Random number of suppliers (with Poisson or range-based noise)
             num_suppliers = max(1, min(
                 self.spec.supplier_pool_size,
                 np.random.poisson(lam=self.spec.suppliers_per_product)
             ))
             product_suppliers = random.sample(suppliers, k=num_suppliers)
 
-            # If modeling SLA per pair:
             supplier_links = [
                 {
                     "supplier_id": s["supplier_id"],
-                    "sla_days": random.randint(1, 7)  # override or complement base SLA
+                    "sla_days": random.randint(1, 7)
                 } for s in product_suppliers
             ]
+
+            price = round(random.uniform(5.0, 200.0), 2)  # Valor entre R$5 e R$200
 
             products.append({
                 "product_id": product_id,
                 "name": self.fake.word().capitalize(),
                 "category": category,
                 "seasonality": seasonality,
+                "price": price,
                 "suppliers": supplier_links
             })
-        
-        products_df=pl.DataFrame(products)
-        logger.info(f"✅ {len(products_df)} supliers generated.")
 
+        products_df = pl.DataFrame(products)
+        logger.info(f"✅ {len(products_df)} products generated.")
         return products_df
 
-    def generate_transactions(
-            self, 
-            customers: pl.DataFrame, 
-            stores: pl.DataFrame, 
-            products: pl.DataFrame, 
-            suppliers: Dict[str, List[Dict]],
-            parallel: bool = True
-        ) -> pl.DataFrame:
+    def generate_orders_and_transactions(
+        self,
+        customers: pl.DataFrame,
+        stores: pl.DataFrame,
+        products: pl.DataFrame,
+        suppliers: Dict[str, List[Dict]]
+    ) -> tuple[pl.DataFrame, pl.DataFrame]:
+
         custs = customers.to_dicts()
         prods = products.to_dicts()
+
+        price_map = {
+            p['product_id']: p.get('price', 1.0) or 1.0
+            for p in prods
+        }
+
         stores_map = {s['store_id']: s for s in stores.to_dicts()}
         store_ids = list(stores_map.keys())
-
-        end = self.parse_date(self.spec.data_end)
-
-        # Criar a instância de controle de estoque
-        stock_manager = StockManager(self.spec.initial_stock_range, Lock())
+        end = parse_date(self.spec.data_end)
 
         def generate_for_customer(cust):
             region = self.geo_cluster_manager.assign_to_region(cust['latitude'], cust['longitude'])
-            region_store_ids = [store['store_id'] for store in self.geo_cluster_manager.regions[region]]
+            region_store_ids = [s['store_id'] for s in stores_map.values() if s.get('region') == region]
+            if not region_store_ids:
+                return [], None
 
+            order_id = str(uuid4())
+            order_total = 0.0
+            any_returned = False
             transactions = []
-            for _ in range(random.randint(1, 8)):
+
+            num_items = random.randint(1, 8)
+            txn_date = random_date_weighted(cust['registration_date'], end)
+
+            for _ in range(num_items):
                 pid = random.choice(prods)['product_id']
-                sid = random.choice(region_store_ids)  # Select store from the region
-
+                sid = random.choice(region_store_ids)
                 qty = random.randint(1, 5)
-                decrement_qty = stock_manager.check_and_decrement(sid, pid, qty)
-                
-                if decrement_qty <= 0:
-                    continue  # Produto indisponível
 
-                txn_date = random_date_weighted(cust['registration_date'], end)
-                price = price_map[pid] * decrement_qty
+                actual_qty = self.stock_manager.check_and_decrement(sid, pid, qty)
+                if actual_qty <= 0:
+                    continue
+
+                price_unit = price_map.get(pid, 1.0)
+                price_total = round(price_unit * actual_qty, 2)
+
                 dist = calculate_distance(
                     cust['latitude'], cust['longitude'],
                     stores_map[sid]['latitude'], stores_map[sid]['longitude']
                 )
 
                 txn = {
+                    'order_id': order_id,
                     'customer_id': cust['customer_id'],
                     'product_id': pid,
                     'store_id': sid,
-                    'quantity': decrement_qty,
-                    'total_price': price,
+                    'quantity': actual_qty,
+                    'unit_price': round(price_unit, 2),
+                    'total_price': price_total,
                     'transaction_date': txn_date,
                     'distance_km': round(dist, 2),
                 }
 
                 txn = apply_returns(txn, txn_date, self.spec.return_prob)
+                if not txn.get("is_return"):
+                    order_total += price_total
+                else:
+                    any_returned = True
 
                 transactions.append(txn)
 
-            return transactions
+            if not transactions:
+                return [], None
 
-        # Gerar transações com execução paralela ou sequencial
+            status = (
+                "returned" if all(t.get("is_return") for t in transactions) else
+                "partial_return" if any_returned else
+                "completed"
+            )
+
+            order = {
+                'order_id': order_id,
+                'customer_id': cust['customer_id'],
+                'store_id': transactions[0]['store_id'],
+                'timestamp': txn_date,
+                'total_amount': round(order_total, 2),
+                'status': status,
+                'channel': random.choice(['in_store', 'app', 'website'])
+            }
+
+            return transactions, order
+
         all_txns = []
-        if parallel:
-            with ThreadPoolExecutor() as executor:
-                futures = [executor.submit(generate_for_customer, c) for c in custs]
-                for fut in as_completed(futures):
-                    all_txns.extend(fut.result())
-        else:
-            for c in custs:
-                all_txns.extend(generate_for_customer(c))
+        all_orders = []
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            futures = [executor.submit(generate_for_customer, c) for c in custs]
+            for fut in as_completed(futures):
+                txns, order = fut.result()
+                all_txns.extend(txns)
+                if order:
+                    all_orders.append(order)
 
-        logger.info(f"✅ {len(all_txns)} transactions generated across {len(store_ids)} stores.")
-
-        return pl.DataFrame(all_txns)
+        logger.info(f"✅ {len(all_txns)} transactions generated across {len(all_orders)} orders.")
+        return pl.DataFrame(all_txns), pl.DataFrame(all_orders)
 
     def simulate_inventory(
         self, 
         transactions: pl.DataFrame, 
-        suppliers: Dict[str, List[Dict]]
+        products: pl.DataFrame
     ) -> pl.DataFrame:
         stock = {}
-        metrics = []
-        
-        # Initialize 
-        for row in transactions.select(['product_id','store_id']).unique().to_dicts():
+        inventory = []
+
+        # Extrair e normalizar suppliers por produto
+        suppliers = {
+            row['product_id']: [
+                sup for sup in row.get('suppliers', [])
+            ]
+            for row in products.to_dicts()
+        }
+
+        # Inicializa o estoque com base nas combinações produto-loja
+        for row in transactions.select(['product_id', 'store_id']).unique().to_dicts():
             stock[(row['product_id'], row['store_id'])] = random.randint(*self.spec.initial_stock_range)
-        # processa transações cronologicamente
+
+        # Processa transações em ordem cronológica
         for txn in sorted(transactions.to_dicts(), key=lambda x: x['transaction_date']):
             key = (txn['product_id'], txn['store_id'])
             before = stock[key]
             sold = min(before, txn['quantity'])
             stock[key] = before - sold
-            # reposição de estoque se abaixo do ponto de reorder
+
+            # Reposição condicional
             if stock[key] <= self.spec.reorder_point:
-                sup = random.choice(suppliers[txn['product_id']])
-                lead = sup['sla']
-                if random.random() < self.spec.disruption_prob:
-                    lead += random.randint(*self.spec.disruption_duration_days)
-                arrival_date = txn['transaction_date'] + timedelta(days=lead)
-                # atualização imediata; em simulação real, considerar pending orders
-                stock[key] += self.spec.reorder_quantity
-            metrics.append({**txn, 'stock_before': before, 'stock_after': stock[key]})
-        return pl.DataFrame(metrics)
+                supplier_options = suppliers.get(txn['product_id'], [])
+                if supplier_options:
+                    sup = random.choice(supplier_options)
+                    lead = sup.get('sla_days', 2)
+                    if random.random() < self.spec.disruption_prob:
+                        lead += random.randint(*self.spec.disruption_duration_days)
+                    arrival_date = txn['transaction_date'] + timedelta(days=lead)
+                    stock[key] += self.spec.reorder_quantity  # Aqui ainda estamos simulando chegada imediata
+
+            inventory.append({**txn, 'stock_before': before, 'stock_after': stock[key]})
+
+        return pl.DataFrame(inventory)
 
     def compute_metrics(self, data: Dict[str, pl.DataFrame]) -> Dict[str, pl.DataFrame]:
+        logger.info("🚀 Starting metric computation")
+        start_total = perf_counter()
+        results = {}
+
+        metrics_map = {
+            'customer_behavior_metrics': self._customer_metrics,
+            'customer_channel_preferences': self._customer_channel_preferences,
+            'order_summary_metrics': self._order_metrics,
+            'store_performance_metrics': self._store_metrics,
+            'store_channel_distribution': self._store_channel_distribution,
+            'product_return_analysis': self._product_return_analysis,
+            'return_behavior_outliers': self._identify_return_outliers,
+            'average_items_per_order': self._avg_items_per_order,
+            'estimated_total_return_cost': self._estimated_return_cost,
+        }
+
+        for name, func in metrics_map.items():
+            try:
+                logger.info(f"🔍 Computing `{name}`...")
+                start = perf_counter()
+                result = func(data)
+                elapsed = perf_counter() - start
+                results[name] = result
+                logger.info(f"✅ `{name}` computed in {elapsed:.3f}s — shape: {result.shape}")
+            except Exception as e:
+                logger.exception(f"❌ Failed to compute `{name}`: {e}")
+
+        total_elapsed = perf_counter() - start_total
+        logger.info(f"✅ All metrics computed in {total_elapsed:.2f}s")
+        return results
+
+
+    def _customer_metrics(self, data: Dict[str, pl.DataFrame]) -> pl.DataFrame:
         tx = data['transactions']
-        inv = data['inventory']
-        
-        # Clientes não retornados
+        today = date.today()
         df = tx.filter(pl.col('returned') == False)
-        
-        # Frequência e monetário
+
         freq = df.group_by('customer_id').len().rename({'len': 'frequency'})
         rec = df.group_by('customer_id').agg(pl.max('transaction_date').alias('last_date'))
         mon = df.group_by('customer_id').agg(pl.sum('total_price').alias('monetary'))
-        
-        # Recência
-        today = date.today()
-        last_dates = rec['last_date'].to_list()
-        recency_list = [(today - d).days for d in last_dates]
-        rec = rec.with_columns(pl.Series('recency_days', recency_list))
+
+        rec = rec.with_columns((pl.lit(today) - pl.col('last_date')).dt.total_days().alias('recency_days'))
         cm = freq.join(rec, on='customer_id').join(mon, on='customer_id')
+        cm = cm.with_columns((pl.col('monetary') / pl.col('frequency')).alias('avg_ticket'))
 
-        # Métricas de loja: vendas e perdidos
+        dist = tx.group_by('customer_id').agg(pl.mean('distance_km').alias('avg_distance_km'))
+        cm = cm.join(dist, on='customer_id')
+
+        total_tx = tx.group_by('customer_id').len().rename({'len': 'total_tx'})
+        returns = tx.filter(pl.col('returned') == True).group_by('customer_id').len().rename({'len': 'returns'})
+        returns = total_tx.join(returns, on='customer_id', how='left').fill_null(0)
+        returns = returns.with_columns((pl.col('returns') / pl.col('total_tx')).alias('return_rate'))
+
+        return cm.join(returns.select(['customer_id', 'return_rate']), on='customer_id')
+
+    def _customer_channel_preferences(self, data: Dict[str, pl.DataFrame]) -> pl.DataFrame:
+        orders = data['orders']
+        return orders.group_by(['customer_id', 'channel']).len().rename({'len': 'count'})
+
+    def _order_metrics(self, data: Dict[str, pl.DataFrame]) -> pl.DataFrame:
+        orders = data['orders']
+        num_orders = orders.height
+        total_sales = orders['total_amount'].sum()
+
+        aov = total_sales / num_orders if num_orders else 0
+        return_rate = orders.filter(
+            pl.col('status').is_in(['returned', 'partial_return'])
+        ).height / num_orders if num_orders else 0
+
+        lead_time = (
+            (orders['delivery_date'] - orders['timestamp']).dt.days.mean()
+            if 'delivery_date' in orders.columns else None
+        )
+
+        return pl.DataFrame([{
+            'aov': aov,
+            'return_rate_orders': return_rate,
+            'avg_lead_time_days': lead_time,
+        }])
+
+    def _store_metrics(self, data: Dict[str, pl.DataFrame]) -> pl.DataFrame:
+        tx = data['transactions']
+        inv = data['inventory']
+        orders = data['orders']
+
         sold = inv.group_by('store_id').agg(pl.sum('quantity').alias('total_sold'))
-        lost_amount = [(row['quantity'] - row['stock_after']) for row in inv.to_dicts()]
+        lost = inv.with_columns((pl.col('quantity') - pl.col('stock_after')).alias('lost_sales'))
+        lost = lost.group_by('store_id').agg(pl.sum('lost_sales').alias('lost_sales'))
 
-        lost_df = pl.DataFrame(inv.to_dicts()).with_columns(pl.Series('lost_sales', lost_amount))
-        lost = lost_df.group_by('store_id').agg(pl.sum('lost_sales').alias('lost_sales'))
-        sm = sold.join(lost, on='store_id')
-        
-        return {
-            'customer_metrics': cm, 
-            'store_metrics': sm
-        }
+        store_metrics = sold.join(lost, on='store_id')
+        store_metrics = store_metrics.with_columns(
+            (pl.col('total_sold') / (pl.col('total_sold') + pl.col('lost_sales'))).alias('conversion_rate')
+        )
+
+        sales = tx.group_by('store_id').agg(pl.sum('total_price').alias('total_sales'))
+        order_counts = orders.group_by('store_id').len().rename({'len': 'order_count'})
+        store_metrics = store_metrics.join(sales, on='store_id', how='left') \
+                                     .join(order_counts, on='store_id', how='left')
+
+        store_metrics = store_metrics.with_columns(
+            (pl.col('total_sales') / pl.col('order_count')).alias('avg_order_value_store')
+        )
+
+        return_tx = tx.filter(pl.col('returned') == True)
+        return_mean = return_tx.group_by('store_id').agg(
+            pl.mean('total_price').alias('avg_return_value')
+        )
+        return store_metrics.join(return_mean, on='store_id', how='left').fill_null(0)
+
+    def _store_channel_distribution(self, data: Dict[str, pl.DataFrame]) -> pl.DataFrame:
+        orders = data['orders']
+        return orders.group_by(['store_id', 'channel']).len().rename({'len': 'count'})
+
+    def _product_return_analysis(self, data: Dict[str, pl.DataFrame]) -> pl.DataFrame:
+        tx = data['transactions']
+        total = tx.group_by('product_id').len().rename({'len': 'total_tx'})
+        returned = tx.filter(pl.col('returned')).group_by('product_id').len().rename({'len': 'returns'})
+        return total.join(returned, on='product_id', how='left') \
+                    .fill_null(0) \
+                    .with_columns((pl.col('returns') / pl.col('total_tx')).alias('return_rate'))
+
+    def _identify_return_outliers(self, data: Dict[str, pl.DataFrame]) -> pl.DataFrame:
+        tx = data['transactions']
+        returns = tx.filter(pl.col('returned') == True).group_by('customer_id').len().rename({'len': 'returns'})
+        quantile_95 = returns['returns'].quantile(0.95)
+        return returns.filter(pl.col('returns') >= quantile_95)
+
+    def _avg_items_per_order(self, data: Dict[str, pl.DataFrame]) -> pl.DataFrame:
+        tx = data['transactions']
+        return tx.group_by('order_id').len().mean().rename({'len': 'avg_items'})
+
+    def _estimated_return_cost(self, data: Dict[str, pl.DataFrame]) -> pl.DataFrame:
+        tx = data['transactions'].filter(pl.col('returned') == True)
+        return_cost = tx.with_columns((pl.col('quantity') * pl.col('total_price') / pl.col('quantity')).alias('unit_price'))
+        return_cost = return_cost.with_columns((pl.col('quantity') * pl.col('unit_price') * 1.2).alias('estimated_cost'))
+        total_cost = return_cost['estimated_cost'].sum()
+        return pl.DataFrame([{'total_return_cost': total_cost}])
 
     def write(self, uri: str, data: Dict[str, pl.DataFrame]):
         parsed = urlparse(uri)
@@ -651,20 +774,24 @@ class RetailDataGenerator:
     def generate_retail_data(self) -> Dict[str, pl.DataFrame]:
         customers=self.generate_customers(); 
         stores=self.generate_stores(); 
-        products, suppliers=self.generate_products()
-        transactions = self.generate_transactions(customers, stores, products, suppliers)
-        inventory = self.simulate_inventory(transactions, suppliers)
+        suppliers=self.generate_suppliers()
+        products=self.generate_products(suppliers)
+        transactions, orders = self.generate_orders_and_transactions(customers, stores, products, suppliers)
+        inventory = self.simulate_inventory(transactions, products)
         
         return {
             'customers':customers,
             'stores':stores,
-            'products':products,
             'suppliers': suppliers,
+            'products':products,
+            'orders': orders,
             'transactions':transactions,
             'inventory': inventory,
         }
 
-    def run(self) -> Dict[str,pl.DataFrame]:
+    def run(self) -> Dict[str, pl.DataFrame]:
+        start_time = perf_counter()
+
         try:
             logger.info("🛒 Generating retail data...")
             retail_data = self.generate_retail_data()
@@ -673,28 +800,26 @@ class RetailDataGenerator:
             raise
 
         try:
-            logger.info("📊 Generating retail metrics...")
+            logger.info("📊 Computing retail metrics...")
             metrics = self.compute_metrics(retail_data)
         except Exception as e:
-            logger.error(f"❌ Error computing retail metrics: {e}")
+            logger.error(f"❌ Error computing metrics: {e}")
             raise
 
         try:
-            logger.info("🧩 Updating data with metrics...")
-            retail_data.update(metrics)
+            logger.info(f"📦 Writing raw data to `{self.spec.destination}/raw`...")
+            self.write(uri=self.spec.destination + "/raw", data=retail_data)
+
+            logger.info(f"📦 Writing metrics to `{self.spec.destination}/metrics`...")
+            self.write(uri=self.spec.destination + "/mart", data=metrics)
         except Exception as e:
-            logger.error(f"❌ Error updating data with metrics: {e}")
+            logger.error(f"❌ Error writing to sink: {e}")
             raise
 
-        try:
-            logger.info("📦 Populating data sink...")
-            self.write(self.spec.destination, retail_data)
-        except Exception as e:
-            logger.error(f"❌ Error populating data sink: {e}")
-            raise
-
-        logger.info("✅ Synthetic retail data generation complete!")
+        elapsed = perf_counter() - start_time
+        logger.info(f"🏁 Synthetic retail data generation complete in {elapsed:.2f}s")
         return retail_data
+
 
 # Define Clusterization Types as Labels
 class ClusterizationType:
@@ -768,7 +893,7 @@ def main():
         help="Random seed for reproducibility"
     )
     parser.add_argument(
-        "--destination", type=str, default='duckdb://data/retail.db', 
+        "--destination", type=str, default='./data', 
         help="Data sink URI (e.g. duckdb://data.db or ./data)"
     )
     
@@ -791,7 +916,6 @@ def main():
         num_customers=args.num_customers,
         num_products=args.num_products,
         num_transactions=args.num_transactions,
-        num_stores=args.num_stores,
         seed=args.seed,
         destination=args.destination or RetailDataSpec().destination,
         geo_clusters=geo_clusters
@@ -800,8 +924,6 @@ def main():
     # Run generator
     gen = RetailDataGenerator(spec)
     gen.run()
-
-
 
 if __name__ == '__main__':
     main()
