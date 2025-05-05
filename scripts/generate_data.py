@@ -3,8 +3,10 @@ import os
 import random
 import json
 from time import perf_counter
+from enum import Enum
 import logging
 from urllib.parse import urlparse
+from copy import deepcopy
 from uuid import uuid4
 import argparse
 from datetime import date, timedelta
@@ -15,7 +17,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from collections import defaultdict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator, field_validator
+from pydantic.functional_validators import AfterValidator
 import polars as pl
 import numpy as np
 import duckdb
@@ -30,6 +33,62 @@ logger = logging.getLogger("retail_gen")
 logger.setLevel(logging.INFO)
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 
+# --- Enums
+
+class ClusterizationType(str, Enum):
+    GEOGRAPHIC_EXPANSION = "geographic"
+    ECONOMIC_SEGMENTS = "economic"
+    MARKET_MATURITY = "maturity"
+    LIFESTYLE_SEGMENTS = "lifestyle" 
+    TIME_SENSITIVE = "time"
+    AGE_SPECIFIC = "age"
+    
+
+
+# --- Channel Weights
+
+class ChannelWeights(BaseModel):
+    online: float = 0.5
+    in_store: float = 0.5
+
+    @model_validator(mode="after")
+    def validate_sum(self):
+        total = self.online + self.in_store
+        if not 0.99 <= total <= 1.01:
+            raise ValueError("Channel weights must sum to approximately 1.0")
+        return self
+
+
+# --- Income Distribution
+
+class IncomeDistribution(BaseModel):
+    low: float
+    medium: float
+    high: float
+
+    @model_validator(mode="after")
+    def validate_sum(self):
+        total = self.low + self.medium + self.high
+        if not 0.99 <= total <= 1.01:
+            raise ValueError("Income distribution must sum to approximately 1.0")
+        return self
+
+
+# --- Demographics
+
+class Demographics(BaseModel):
+    age_range: List[int] = Field(default_factory=lambda: [18, 65])
+    income_dist: IncomeDistribution
+
+    @field_validator("age_range")
+    def validate_age_range(cls, v: List[int]):
+        if len(v) != 2 or v[0] >= v[1]:
+            raise ValueError("age_range must be [min_age, max_age]")
+        return v
+
+
+# --- Cluster Spec
+
 class GeoClusterSpec(BaseModel):
     name: str
     lat: float
@@ -37,44 +96,220 @@ class GeoClusterSpec(BaseModel):
     radius_km: int
     num_stores: int
     weight: float
-    channel_weights: Dict[str, float] = Field(default_factory=lambda: {"online": 0.5, "in_store": 0.5})
-    income_dist: Dict[str, float] = Field(default_factory=lambda: {"low": 0.3, "medium": 0.5, "high": 0.2})
-    age_range: List[int] = Field(default_factory=lambda: [18, 65])
+    channels: ChannelWeights = Field(default_factory=ChannelWeights)
+    demographics: Demographics = Field(default_factory=lambda: Demographics(
+        income_dist=IncomeDistribution(low=0.3, medium=0.5, high=0.2)
+    ))
 
-@dataclass
-class RetailDataSpec:
-    num_customers: int = 100
-    num_products: int = 50
-    num_transactions: int = 500
-    reg_date_start: str = '-2y'
-    data_end: str = 'today'
-    seed: Optional[int] = None
-    destination: str = field(default_factory=lambda: os.getenv('RETAIL_DESTINATION', './data'))
-    parquet_compression: Optional[str] = None
+    @classmethod
+    def default_demographics(cls) -> Demographics:
+        return cls.model_fields["demographics"].default_factory()
 
-    # Inventory & supply
-    suppliers_per_product: int = 2
-    return_prob: float = 0.05
-    disruption_prob: float = 0.1
-    disruption_duration_days: Tuple[int, int] = (3, 10)
-    initial_stock_range: Tuple[int, int] = (20, 200)
-    reorder_point: int = 10
-    reorder_quantity: int = 100
-    reorder_lead_time_days: Tuple[int, int] = (1, 5)
-    
-    # Product modeling
-    product_categories: List[str] = field(default_factory=lambda: ['grocery', 'beverage', 'electronics', 'apparel', 'personal_care'])
-    product_seasonality: List[str] = field(default_factory=lambda: ['none', 'summer', 'winter'])
-    supplier_pool_size: int = 10
 
-    # Geography & customer distribution
-    geo_clusters: List[GeoClusterSpec] = field(default_factory=list)
+# --- Cluster Config Builder
 
-    def __post_init__(self):
-        assert self.num_customers > 0
-        assert self.num_products > 0
-        assert self.num_transactions > 0
-        assert self.geo_clusters, "❌ You must define at least one geo_cluster"
+class ClusterConfigBuilder:
+    @staticmethod
+    def build_cluster(entry: dict) -> GeoClusterSpec:
+        age_range = entry.get("age_range")
+        income_dist = entry.get("income_dist")
+
+        if (age_range is not None) != (income_dist is not None):
+            raise ValueError(f"Incomplete demographics in cluster '{entry.get('name', 'unknown')}': both age_range and income_dist are required")
+
+        demographics = (
+            Demographics(age_range=age_range, income_dist=IncomeDistribution(**income_dist))
+            if age_range and income_dist
+            else GeoClusterSpec.default_demographics()
+        )
+
+        return GeoClusterSpec(
+            name=entry["name"],
+            lat=entry["lat"],
+            lon=entry["lon"],
+            radius_km=entry["radius_km"],
+            num_stores=entry["num_stores"],
+            weight=entry["weight"],
+            channels=ChannelWeights(**entry["channels"]) if "channels" in entry else ChannelWeights(),
+            demographics=demographics
+        )
+
+    @staticmethod
+    def build_cluster_set(data: Dict[ClusterizationType, List[dict]]) -> Dict[ClusterizationType, List[GeoClusterSpec]]:
+        cluster_set = {
+            cluster_type: [ClusterConfigBuilder.build_cluster(entry) for entry in entries]
+            for cluster_type, entries in data.items()
+        }
+
+        # Validate weights sum ≈ 1.0 for each type
+        for cluster_type, clusters in cluster_set.items():
+            total_weight = sum(cluster.weight for cluster in clusters)
+            if not 0.99 <= total_weight <= 1.01:
+                raise ValueError(f"Cluster weights for {cluster_type.value} must sum to 1.0 (got {total_weight:.2f})")
+
+        return cluster_set
+
+# --- Cluster Manager
+
+class GeoClusterManager:
+    def __init__(self, geo_clusters: List[GeoClusterSpec]):
+        """Initialize with a list of GeoClusterSpec instances."""
+        self.geo_clusters = {cluster.name: cluster for cluster in geo_clusters}
+
+    def assign_to_region(self, latitude: float, longitude: float) -> str:
+        """Assign a point to the nearest region."""
+        closest_region = None
+        closest_distance = float("inf")
+
+        for region_name, cluster in self.geo_clusters.items():
+            distance = haversine(latitude, longitude, cluster.lat, cluster.lon)
+            if distance < closest_distance:
+                closest_distance = distance
+                closest_region = region_name
+
+        return closest_region
+
+
+# Cluster Data Template
+BASE_CLUSTERS = {
+    "LATAM": {
+        "lat": -23.5505, "lon": -46.6333, "radius_km": 100, "num_stores": 5
+    },
+    "EMEA": {
+        "lat": 48.8566, "lon": 2.3522, "radius_km": 80, "num_stores": 3
+    },
+    "APAC": {
+        "lat": 35.6895, "lon": 139.6917, "radius_km": 60, "num_stores": 4
+    }
+}
+
+DEMOGRAPHICS = {
+    "low_income": {"low": 0.7, "medium": 0.2, "high": 0.1},
+    "middle_income": {"low": 0.3, "medium": 0.6, "high": 0.1},
+    "high_income": {"low": 0.1, "medium": 0.3, "high": 0.6},
+    "mixed": {"low": 0.4, "medium": 0.4, "high": 0.2}
+}
+
+CHANNELS = {
+    "online_focused": {"online": 0.8, "in_store": 0.2},  # High online preference
+    "balanced": {"online": 0.5, "in_store": 0.5},        # Balanced online vs store preference
+    "digital_leaning": {"online": 0.6, "in_store": 0.4},  # Digital-first, but still some in-store
+    "traditional": {"online": 0.3, "in_store": 0.7},     # Store-first, low online preference
+}
+
+CLUSTER_DATA = {
+    ClusterizationType.GEOGRAPHIC_EXPANSION: [
+        {**BASE_CLUSTERS["LATAM"], "name": "LATAM", "weight": 0.5, "channels": CHANNELS["online_focused"], "income_dist": DEMOGRAPHICS["mixed"], "age_range": [20, 65]},
+        {**BASE_CLUSTERS["EMEA"], "name": "EMEA", "weight": 0.3, "channels": CHANNELS["balanced"], "income_dist": DEMOGRAPHICS["middle_income"], "age_range": [25, 60]},
+        {**BASE_CLUSTERS["APAC"], "name": "APAC", "weight": 0.2, "channels": CHANNELS["digital_leaning"], "income_dist": DEMOGRAPHICS["low_income"], "age_range": [18, 55]}
+    ],
+
+    ClusterizationType.ECONOMIC_SEGMENTS: [
+        {**BASE_CLUSTERS["LATAM"], "name": "LATAM", "weight": 0.5, "channels": CHANNELS["online_focused"], "income_dist": DEMOGRAPHICS["low_income"], "age_range": [20, 65]},
+        {**BASE_CLUSTERS["EMEA"], "name": "EMEA", "weight": 0.3, "channels": CHANNELS["balanced"], "income_dist": DEMOGRAPHICS["middle_income"], "age_range": [25, 60]},
+        {**BASE_CLUSTERS["APAC"], "name": "APAC", "weight": 0.2, "channels": CHANNELS["digital_leaning"], "income_dist": DEMOGRAPHICS["mixed"], "age_range": [18, 55]}
+    ],
+
+    ClusterizationType.MARKET_MATURITY: [
+        {**BASE_CLUSTERS["LATAM"], "name": "LATAM", "weight": 0.5, "channels": CHANNELS["traditional"], "income_dist": DEMOGRAPHICS["low_income"], "age_range": [20, 65]},
+        {**BASE_CLUSTERS["EMEA"], "name": "EMEA", "weight": 0.3, "channels": CHANNELS["balanced"], "income_dist": DEMOGRAPHICS["middle_income"], "age_range": [25, 60]},
+        {**BASE_CLUSTERS["APAC"], "name": "APAC", "weight": 0.2, "channels": CHANNELS["digital_leaning"], "income_dist": DEMOGRAPHICS["mixed"], "age_range": [18, 55]}
+    ],
+
+    # Lifestyle Segments
+    ClusterizationType.LIFESTYLE_SEGMENTS: [
+        {
+            "name": "Minimalists",
+            "lat": 40.7128, "lon": -74.0060, "radius_km": 20,
+            "num_stores": 2, "weight": 0.2,
+            "channels": CHANNELS["online_focused"],
+            "income_dist": DEMOGRAPHICS["mixed"],
+            "age_range": [30, 60]
+        },
+        {
+            "name": "Trend Chasers",
+            "lat": 34.0522, "lon": -118.2437, "radius_km": 30,
+            "num_stores": 4, "weight": 0.3,
+            "channels": CHANNELS["online_focused"],
+            "income_dist": DEMOGRAPHICS["low_income"],
+            "age_range": [18, 35]
+        },
+        {
+            "name": "Deal Hunters",
+            "lat": 41.8781, "lon": -87.6298, "radius_km": 25,
+            "num_stores": 3, "weight": 0.25,
+            "channels": CHANNELS["balanced"],
+            "income_dist": DEMOGRAPHICS["middle_income"],
+            "age_range": [25, 50]
+        },
+        {
+            "name": "Eco-Conscious",
+            "lat": 37.7749, "lon": -122.4194, "radius_km": 15,
+            "num_stores": 2, "weight": 0.15,
+            "channels": CHANNELS["online_focused"],
+            "income_dist": DEMOGRAPHICS["low_income"],
+            "age_range": [20, 45]
+        },
+        {
+            "name": "Omni Explorers",
+            "lat": 47.6062, "lon": -122.3321, "radius_km": 10,
+            "num_stores": 1, "weight": 0.1,
+            "channels": CHANNELS["balanced"],
+            "income_dist": DEMOGRAPHICS["middle_income"],
+            "age_range": [28, 55]
+        }
+    ],
+
+    # Time-sensitive Segments (specific times of year when spending spikes)
+    ClusterizationType.TIME_SENSITIVE: [
+        {
+            "name": "Holiday Shoppers",
+            "lat": 48.8566, "lon": 2.3522, "radius_km": 60,
+            "num_stores": 5, "weight": 0.4,
+            "channels": CHANNELS["online_focused"],
+            "income_dist": DEMOGRAPHICS["mixed"],
+            "age_range": [20, 50]
+        },
+        {
+            "name": "Back-to-School Shoppers",
+            "lat": 37.7749, "lon": -122.4194, "radius_km": 80,
+            "num_stores": 6, "weight": 0.6,
+            "channels": CHANNELS["digital_leaning"],
+            "income_dist": DEMOGRAPHICS["low_income"],
+            "age_range": [18, 40]
+        }
+    ],
+
+    # Age-Specific Segments (targeting by age group for product/marketing alignment)
+    ClusterizationType.AGE_SPECIFIC: [
+        {
+            "name": "Gen Z",
+            "lat": 34.0522, "lon": -118.2437, "radius_km": 50,
+            "num_stores": 3, "weight": 0.15,
+            "channels": CHANNELS["online_focused"],
+            "income_dist": DEMOGRAPHICS["low_income"],
+            "age_range": [18, 24]
+        },
+        {
+            "name": "Millennials",
+            "lat": 40.7306, "lon": -73.9352, "radius_km": 40,
+            "num_stores": 4, "weight": 0.5,
+            "channels": CHANNELS["balanced"],
+            "income_dist": DEMOGRAPHICS["middle_income"],
+            "age_range": [25, 40]
+        },
+        {
+            "name": "Baby Boomers",
+            "lat": 51.5074, "lon": -0.1278, "radius_km": 70,
+            "num_stores": 2, "weight": 0.35,
+            "channels": CHANNELS["traditional"],
+            "income_dist": DEMOGRAPHICS["middle_income"],
+            "age_range": [55, 75]
+        },
+    ]
+}
+
+cluster_config = ClusterConfigBuilder.build_cluster_set(CLUSTER_DATA)
 
 # ---------------------------
 # Utility functions
@@ -83,7 +318,7 @@ class RetailDataSpec:
 def random_date_weighted(start_date, end_date):
     """Generate random weight-based dates"""
     weights_by_month = {
-        1: 0.5, 2: 0.8, 3: 1.0, 12: 2.0,  # dezembro pesa mais
+        1: 0.5, 2: 0.8, 3: 1.0, 12: 2.0,
     }
     delta = (end_date - start_date).days
     while True:
@@ -155,35 +390,138 @@ def estimate_sla_days(from_loc, to_loc, base=500, jitter=True):
 
 # ----------------------------
 # Storage Layer
-# ----------------------------
+# ----------------------------# 
+
+# === Protocols ===
+from abc import ABC, abstractmethod
+
 class DataSink(Protocol):
+    @property
+    @abstractmethod
+    def supports_format_selection(self) -> bool:
+        ...
+
     def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None) -> None:
         ...
 
-class CSVSink:
-    def __init__(self, base_path: str):
-        self.base_path = Path(base_path)
-        self.base_path.mkdir(parents=True, exist_ok=True)
+    def read(self, source: Optional[str] = None) -> Dict[str, pl.DataFrame]:
+        ...
 
+# === Base Context ===
+
+class SinkContext(ABC):
+    @abstractmethod
     def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None) -> None:
-        output_path = self.base_path / destination if destination else self.base_path
-        output_path.mkdir(parents=True, exist_ok=True)
-        for name, df in data.items():
-            df.write_csv(output_path / f"{name}.csv")
+        pass
 
-class ParquetSink:
-    def __init__(self, base_path: str, compression: Optional[str] = None):
+    @abstractmethod
+    def read(self, source: Optional[str] = None) -> Dict[str, pl.DataFrame]:
+        pass
+
+# === File Formats ===
+
+class FileFormatHandler(ABC):
+    @abstractmethod
+    def write(self, df: pl.DataFrame, path: Path):
+        pass
+    
+    @abstractmethod
+    def read(self, path: Path) -> pl.DataFrame:
+        pass
+
+class CSVHandler(FileFormatHandler):
+    def write(self, df: pl.DataFrame, path: Path):
+        df.write_csv(path)
+    
+    def read(self, path: Path) -> pl.DataFrame:
+        return pl.read_csv(path)
+
+class ParquetHandler(FileFormatHandler):
+    def write(self, df: pl.DataFrame, path: Path):
+        df.write_parquet(path)
+    
+    def read(self, path: Path) -> pl.DataFrame:
+        return pl.read_parquet(path)
+
+class JSONLHandler(FileFormatHandler):
+    def write(self, df: pl.DataFrame, path: Path):
+        df.write_ndjson(path)
+    
+    def read(self, path: Path) -> pl.DataFrame:
+        return pl.read_ndjson(path)
+
+class FeatherHandler(FileFormatHandler):
+    def write(self, df: pl.DataFrame, path: Path):
+        df.write_ipc(path)
+    
+    def read(self, path: Path) -> pl.DataFrame:
+        return pl.read_ipc(path)
+
+FORMAT_HANDLERS = {
+    'csv': CSVHandler(),
+    'parquet': ParquetHandler(),
+    'jsonl': JSONLHandler(),
+    'feather': FeatherHandler(),
+}
+
+AVAILABLE_FORMATS = tuple(FORMAT_HANDLERS.keys())
+
+# === Filesystem Sinks ===
+
+SINK_REGISTRY = {}
+
+def register_sink(scheme: str, file_formats: Tuple[str] = ()):
+    """
+    Registers a sink class for the given scheme and file formats.
+
+    Args:
+        scheme (str): The scheme (e.g., 'file', 'cloud', etc.).
+        file_formats (tuple): A tuple of supported file formats (e.g., 'csv', 'parquet').
+    
+    This decorator registers the given class for the specified formats in the SINK_REGISTRY.
+    """
+    def decorator(cls):
+        for file_format in file_formats:
+            if (scheme, file_format) not in SINK_REGISTRY:
+                SINK_REGISTRY[(scheme, file_format)] = cls
+            else:
+                raise ValueError(f"Sink already registered for {scheme} and format {file_format}")
+        return cls
+    return decorator
+
+@register_sink('file', AVAILABLE_FORMATS)
+class FileSink(DataSink):
+    def __init__(self, base_path: str, file_format: str = "csv"):
         self.base_path = Path(base_path)
-        self.base_path.mkdir(parents=True, exist_ok=True)
-        self.compression = compression
+        self.file_format = file_format
+        self.format_handler = FORMAT_HANDLERS.get(file_format)
 
-    def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None) -> None:
-        output_path = self.base_path / destination if destination else self.base_path
-        output_path.mkdir(parents=True, exist_ok=True)
+        if not self.format_handler:
+            raise ValueError(f"Unsupported file format: {file_format}")
+
+    @property
+    def supports_format_selection(self) -> bool:
+        return True
+
+    def write(self, data: dict, destination: Optional[str] = None):
         for name, df in data.items():
-            df.write_parquet(output_path / f"{name}.parquet", compression=self.compression)
+            path = self.base_path / destination / f"{name}.{self.file_format}"
+            
+            os.makedirs(path.parent, exist_ok=True)
+            
+            self.format_handler.write(df, path)
 
-class DuckDBSink:
+    def read(self, source: Optional[str] = None) -> dict:
+        result = {}
+        path = self.base_path / source if source else self.base_path
+        for file in path.glob(f"*.{self.file_format}"):
+            name = file.stem
+            result[name] = self.format_handler.read(file)
+        return result
+
+# === Database Sinks ===
+@register_sink('duckdb')
+class DuckDBSink(DataSink):
     def __init__(self, db_path: str):
         self.db_path = db_path
 
@@ -196,152 +534,132 @@ class DuckDBSink:
             con.unregister(name)
         con.close()
 
-class JSONLSink:
-    def __init__(self, base_path: str):
-        self.base_path = Path(base_path)
-        self.base_path.mkdir(parents=True, exist_ok=True)
+    def read(self, source: Optional[str] = None) -> Dict[str, pl.DataFrame]:
+        raise NotImplementedError("Reading from DuckDB not implemented yet")
 
-    def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None) -> None:
-        output_path = self.base_path / destination if destination else self.base_path
-        output_path.mkdir(parents=True, exist_ok=True)
-        for name, df in data.items():
-            with open(output_path / f"{name}.jsonl", "w", encoding="utf-8") as f:
-                for row in df.iter_rows(named=True):
-                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-class MySQLSink:
+@register_sink('mysql')
+class MySQLSink(DataSink):
     def __init__(self, db_url: str):
-        self.db_url = db_url
         self.engine = create_engine(db_url, future=True)
 
-    def write(
-        self,
-        data: Dict[str, pl.DataFrame],
-        database: Optional[str] = None,
-        schema: Optional[str] = None,  # unused
-    ) -> None:
+    def write(self, data: Dict[str, pl.DataFrame], database: Optional[str] = None) -> None:
         with self.engine.begin() as conn:
             if database:
-                try:
-                    logger.info(f"🛠️ Creating database `{database}` if not exists...")
-                    conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{database}`"))
-                    conn.execute(text(f"USE `{database}`"))
-                except Exception as e:
-                    logger.warning(f"⚠️ Could not ensure database `{database}` exists: {e}")
-            else:
-                logger.warning("⚠️ No database provided — writing to current/default database.")
-
+                conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{database}`"))
+                conn.execute(text(f"USE `{database}`"))
             for name, df in data.items():
-                try:
-                    logger.info(f"📥 Writing table `{name}` to MySQL...")
-                    df.write_database(table_name=name, connection=conn, if_exists="replace")
-                except Exception as e:
-                    logger.error(f"❌ Failed to write table `{name}` to MySQL: {e}")
+                df.write_database(name, conn, if_exists="replace")
 
-class PostgreSQLSink:
+    def read(self, source: Optional[str] = None) -> Dict[str, pl.DataFrame]:
+        raise NotImplementedError("Reading from MySQL not implemented")
+
+@register_sink('postgresql')
+class PostgreSQLSink(DataSink):
     def __init__(self, db_url: str):
-        self.db_url = db_url
         self.engine = create_engine(db_url, future=True)
 
-    def write(
-        self,
-        data: Dict[str, pl.DataFrame],
-        database: Optional[str] = None,  # unused
-        schema: Optional[str] = None
-    ) -> None:
+    def write(self, data: Dict[str, pl.DataFrame], schema: Optional[str] = None) -> None:
         with self.engine.begin() as conn:
             if schema:
-                try:
-                    logger.info(f"🛠️ Creating schema `{schema}` if not exists...")
-                    conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS \"{schema}\""))
-                except Exception as e:
-                    logger.warning(f"⚠️ Could not ensure schema `{schema}` exists: {e}")
-
+                conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
             for name, df in data.items():
-                table_name = f"{schema}.{name}" if schema else name
-                try:
-                    logger.info(f"📥 Writing table `{table_name}` to PostgreSQL...")
-                    df.write_database(table_name=table_name, connection=conn, if_exists="replace")
-                except Exception as e:
-                    logger.error(f"❌ Failed to write table `{table_name}` to PostgreSQL: {e}")
+                full_name = f"{schema}.{name}" if schema else name
+                df.write_database(full_name, conn, if_exists="replace")
 
-class FeatherSink:
-    def __init__(self, base_path: str):
-        self.base_path = Path(base_path)
-        self.base_path.mkdir(parents=True, exist_ok=True)
+    def read(self, source: Optional[str] = None) -> Dict[str, pl.DataFrame]:
+        raise NotImplementedError("Reading from PostgreSQL not implemented")
 
-    def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None) -> None:
-        output_path = self.base_path / destination if destination else self.base_path
-        output_path.mkdir(parents=True, exist_ok=True)
-        for name, df in data.items():
-            df.write_ipc(output_path / f"{name}.feather")
-
-class InMemorySink:
-    def __init__(self):
-        self.storage = {}
+@register_sink('sqlite')
+class SQLiteSink(DataSink):
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.engine = create_engine(f"sqlite:///{db_path}", future=True)
 
     def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None) -> None:
-        key = destination or "default"
-        self.storage[key] = data
+        engine = self.engine if not destination else create_engine(f"sqlite:///{destination}", future=True)
+        with engine.begin() as conn:
+            for name, df in data.items():
+                df.write_database(name, conn, if_exists="replace")
 
-class S3ParquetSink:
-    def __init__(self, bucket: str, prefix: str = '', compression: str = "snappy"):
+    def read(self, source: Optional[str] = None) -> Dict[str, pl.DataFrame]:
+        raise NotImplementedError("Reading from SQLite not implemented")
+
+# === Cloud Sinks ===
+
+class CloudFileSink(DataSink):
+    def __init__(self, file_format: str = "parquet", compression: Optional[str] = "snappy"):
+        self.file_format = file_format
+        self.compression = compression
+        # Fetch the appropriate format handler from the registry
+        self.format_handler = FORMAT_HANDLERS.get(file_format)
+        if not self.format_handler:
+            raise ValueError(f"Unsupported format: {file_format}")
+
+    @property
+    def supports_format_selection(self) -> bool:
+        return True
+
+    def _get_bytes(self, df: pl.DataFrame) -> bytes:
+        buf = io.BytesIO()
+        # Use the format handler to write data to a byte buffer
+        self.format_handler.write(df, buf)
+        return buf.getvalue()
+
+    def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None):
+        """
+        Write data to the specified destination.
+        If no destination is provided, use the default path.
+        """
+        raise NotImplementedError("This method should be implemented in subclass")
+
+    def read(self, source: Optional[str] = None) -> Dict[str, pl.DataFrame]:
+        raise NotImplementedError("Reading from cloud sinks not implemented")
+
+@register_sink('s3', AVAILABLE_FORMATS)
+class S3Sink(CloudFileSink):
+    def __init__(self, bucket: str, prefix: str = "", file_format: str = "parquet", compression: str = "snappy"):
+        super().__init__(file_format, compression)
         self.bucket = bucket
         self.default_prefix = prefix.rstrip("/") + "/" if prefix else ''
-        self.compression = compression
         self.s3 = boto_client("s3")
 
     def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None):
+        """
+        Write data to S3.
+        The destination should include the path, such as 'raw' or 'mart'.
+        """
         prefix = destination.rstrip("/") + "/" if destination else self.default_prefix
         for name, df in data.items():
-            buf = io.BytesIO()
-            df.write_parquet(buf, compression=self.compression)
-            key = f"{prefix}{name}.parquet"
-            buf.seek(0)
-            self.s3.upload_fileobj(buf, self.bucket, key)
+            key = f"{prefix}{name}.{self.file_format}"
+            self.s3.upload_fileobj(io.BytesIO(self._get_bytes(df)), self.bucket, key)
 
-class GCSParquetSink:
-    def __init__(self, path: str, compression: str = "snappy"):
+    def read(self, source: Optional[str] = None) -> Dict[str, pl.DataFrame]:
+        raise NotImplementedError("Reading from S3 not implemented")
+
+
+@register_sink('gs', AVAILABLE_FORMATS)
+class GCSSink(CloudFileSink):
+    def __init__(self, path: str, file_format: str = "parquet", compression: str = "snappy"):
+        super().__init__(file_format, compression)
         self.default_path = path.rstrip("/") + "/" if path else ''
-        self.compression = compression
         self.fs = GCSFileSystem()
 
     def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None):
+        """
+        Write data to GCS.
+        The destination should include the path, such as 'raw' or 'mart'.
+        """
         path = destination.rstrip("/") + "/" if destination else self.default_path
         for name, df in data.items():
-            full_path = f"{path}{name}.parquet"
-            with self.fs.open(full_path, "wb") as f:
-                df.write_parquet(f, compression=self.compression)
+            with self.fs.open(f"{path}{name}.{self.file_format}", "wb") as f:
+                f.write(self._get_bytes(df))
 
-class SQLiteSink:
-    def __init__(self, db_path: str):
-        self.default_db_path = db_path
-        self.default_engine = create_engine(f"sqlite:///{db_path}", future=True)
+    def read(self, source: Optional[str] = None) -> Dict[str, pl.DataFrame]:
+        raise NotImplementedError("Reading from GCS not implemented")
 
-    def write(self, data: Dict[str, pl.DataFrame], destination: Optional[str] = None):
-        db_path = destination if destination else self.default_db_path
-        engine = create_engine(f"sqlite:///{db_path}", future=True) if destination else self.default_engine
-        with engine.begin() as conn:
-            for name, df in data.items():
-                df.write_database(table_name=name, connection=conn, if_exists="replace")
-
-class GeoClusterManager:
-    def __init__(self, geo_clusters: List[GeoClusterSpec]):
-        """Initialize with a list of GeoClusterSpec instances."""
-        self.geo_clusters = {cluster.name: cluster for cluster in geo_clusters}
-
-    def assign_to_region(self, latitude: float, longitude: float) -> str:
-        """Assign a point to the nearest region within range, or fallback to nearest overall."""
-        closest_region = None
-        closest_distance = float("inf")
-        
-        for region_name, cluster in self.geo_clusters.items():
-            distance = haversine(latitude, longitude, cluster.lat, cluster.lon)
-            if distance < closest_distance:
-                closest_distance = distance
-                closest_region = region_name
-        
-        return closest_region
+# ----------------------------
+# Business Layer
+# ----------------------------
 
 class StockManager:
     def __init__(self, initial_stock_range: Tuple[int, int], lock: Lock):
@@ -362,35 +680,41 @@ class StockManager:
         key = (store_id, product_id)
         return self.stock[key]
 
+@dataclass
+class RetailDataSpec:
+    num_customers: int = 100
+    num_products: int = 50
+    reg_date_start: str = '-2y'
+    data_end: str = 'today'
+    seed: Optional[int] = None
+    destination: str = field(default_factory=lambda: os.getenv('RETAIL_DESTINATION', './data'))
+    parquet_compression: Optional[str] = None
+
+    # Inventory & supply
+    suppliers_per_product: int = 2
+    return_prob: float = 0.05
+    disruption_prob: float = 0.1
+    disruption_duration_days: Tuple[int, int] = (3, 10)
+    initial_stock_range: Tuple[int, int] = (20, 200)
+    reorder_point: int = 10
+    reorder_quantity: int = 100
+    reorder_lead_time_days: Tuple[int, int] = (1, 5)
+    
+    # Product modeling
+    product_categories: List[str] = field(default_factory=lambda: ['grocery', 'beverage', 'electronics', 'apparel', 'personal_care'])
+    product_seasonality: List[str] = field(default_factory=lambda: ['none', 'summer', 'winter'])
+    supplier_pool_size: int = 10
+
+    # Geography & customer distribution
+    geo_clusters: List[GeoClusterSpec] = field(default_factory=list)
+
+    def __post_init__(self):
+        assert self.num_customers > 0
+        assert self.num_products > 0
+        assert self.geo_clusters, "❌ You must define at least one geo_cluster"
+
 class RetailDataGenerator:
-    _SINK_REGISTRY: Dict[str, Callable[[str, "RetailDataGenerator"], DataSink]] = {
-        # DBs
-        "duckdb": lambda path, gen: DuckDBSink(path),
-        "sqlite": lambda path, gen: SQLiteSink(path),
-        "postgresql": lambda uri, gen: PostgreSQLSink(uri),
-        "mysql": lambda uri, gen: MySQLSink(uri),
-
-        # Local files
-        "parquet": lambda path, gen: ParquetSink(path, compression=gen.spec.parquet_compression),
-        "csv": lambda path, gen: CSVSink(path),
-        "jsonl": lambda path, gen: JSONLSink(path),
-        "feather": lambda path, gen: FeatherSink(path),
-
-        # Cloud
-        "s3": lambda uri, gen: S3ParquetSink(
-            bucket=uri.split("/")[2],  # s3://bucket/key/...
-            prefix="/".join(uri.split("/")[3:]),
-            compression=gen.spec.parquet_compression or "snappy"
-        ),
-        "gcs": lambda uri, gen: GCSParquetSink(
-            path=uri, compression=gen.spec.parquet_compression or "snappy"
-        ),
-
-        # Fallback
-        "file": lambda path, gen: ParquetSink(path, compression=gen.spec.parquet_compression),
-    }
-
-    def __init__(self, spec: RetailDataSpec):
+    def __init__(self, spec: RetailDataSpec, sink: DataSink):
         self.spec = spec
         seed = spec.seed
 
@@ -400,6 +724,7 @@ class RetailDataGenerator:
         self.fake = Faker(seed) if seed is not None else Faker()
         self.geo_cluster_manager = GeoClusterManager(geo_clusters=spec.geo_clusters)
         self.stock_manager = StockManager(self.spec.initial_stock_range, Lock())
+        self.sink = sink
 
     def generate_customers(self) -> pl.DataFrame:
         start_date = parse_date(self.spec.reg_date_start)
@@ -416,33 +741,37 @@ class RetailDataGenerator:
             cluster = random.choices(clusters, weights=cluster_weights)[0]
 
             lat, lon = random_geo_around(cluster.lat, cluster.lon, cluster.radius_km)
-
             registration = self.fake.date_between(start_date, end_date)
 
+            # Access channel preference from nested ChannelWeights model
             channel = random.choices(
-                population=['online', 'in_store'],
-                weights=[cluster.channel_weights.get('online', 0.5),
-                         cluster.channel_weights.get('in_store', 0.5)]
+                population=["online", "in_store"],
+                weights=[cluster.channels.online, cluster.channels.in_store]
             )[0]
 
+            # Access demographics safely
+            if not cluster.demographics:
+                raise ValueError(f"❌ Cluster '{cluster.name}' missing demographics.")
+
+            age = random.randint(*cluster.demographics.age_range)
             income = random.choices(
-                population=['low', 'medium', 'high'],
-                weights=[cluster.income_dist.get('low', 0.3),
-                         cluster.income_dist.get('medium', 0.5),
-                         cluster.income_dist.get('high', 0.2)]
+                population=["low", "medium", "high"],
+                weights=[
+                    cluster.demographics.income_dist.low,
+                    cluster.demographics.income_dist.medium,
+                    cluster.demographics.income_dist.high
+                ]
             )[0]
-
-            age = random.randint(*cluster.age_range)
 
             customers.append({
-                'customer_id': self.fake.uuid4(),
-                'registration_date': registration,
-                'age': age,
-                'income': income,
-                'channel_pref': channel,
-                'latitude': round(lat, 6),
-                'longitude': round(lon, 6),
-                'region': cluster.name,
+                "customer_id": self.fake.uuid4(),
+                "registration_date": registration,
+                "age": age,
+                "income": income,
+                "channel_pref": channel,
+                "latitude": round(lat, 6),
+                "longitude": round(lon, 6),
+                "region": cluster.name,
             })
 
         logger.info(f"✅ {len(customers)} customers generated across {len(clusters)} geo clusters.")
@@ -480,7 +809,7 @@ class RetailDataGenerator:
 
     def generate_products(self, suppliers: Union[List[dict], pl.DataFrame]) -> pl.DataFrame:
         categories = self.spec.product_categories
-        seasonalities = self.spec.product_seasonality
+        seasonality = self.spec.product_seasonality
 
         if not isinstance(suppliers, list):
             suppliers = suppliers.to_dicts()
@@ -488,7 +817,7 @@ class RetailDataGenerator:
         products = []
         for i in range(self.spec.num_products):
             category = random.choice(categories)
-            seasonality = random.choice(seasonalities)
+            seasonality = random.choice(seasonality)
             product_id = f"prod_{i}"
 
             num_suppliers = max(1, min(
@@ -504,7 +833,8 @@ class RetailDataGenerator:
                 } for s in product_suppliers
             ]
 
-            price = round(random.uniform(5.0, 200.0), 2)  # Valor entre R$5 e R$200
+            # Values between $5 and $200
+            price = round(random.uniform(5.0, 200.0), 2)
 
             products.append({
                 "product_id": product_id,
@@ -512,7 +842,7 @@ class RetailDataGenerator:
                 "category": category,
                 "seasonality": seasonality,
                 "price": price,
-                "suppliers": supplier_links
+                "suppliers": json.dumps(supplier_links)
             })
 
         products_df = pl.DataFrame(products)
@@ -523,8 +853,7 @@ class RetailDataGenerator:
         self,
         customers: pl.DataFrame,
         stores: pl.DataFrame,
-        products: pl.DataFrame,
-        suppliers: Dict[str, List[Dict]]
+        products: pl.DataFrame
     ) -> tuple[pl.DataFrame, pl.DataFrame]:
 
         custs = customers.to_dicts()
@@ -632,7 +961,7 @@ class RetailDataGenerator:
         stock = {}
         inventory = []
 
-        # Extrair e normalizar suppliers por produto
+        # Extract and normalize suppliers by product
         suppliers = {
             row['product_id']: [
                 sup for sup in row.get('suppliers', [])
@@ -640,18 +969,18 @@ class RetailDataGenerator:
             for row in products.to_dicts()
         }
 
-        # Inicializa o estoque com base nas combinações produto-loja
+        # Initializes storage based on product-store combinations
         for row in transactions.select(['product_id', 'store_id']).unique().to_dicts():
             stock[(row['product_id'], row['store_id'])] = random.randint(*self.spec.initial_stock_range)
 
-        # Processa transações em ordem cronológica
+        # Process transactions chronologically
         for txn in sorted(transactions.to_dicts(), key=lambda x: x['transaction_date']):
             key = (txn['product_id'], txn['store_id'])
             before = stock[key]
             sold = min(before, txn['quantity'])
             stock[key] = before - sold
 
-            # Reposição condicional
+            # Conditional replenishment
             if stock[key] <= self.spec.reorder_point:
                 supplier_options = suppliers.get(txn['product_id'], [])
                 if supplier_options:
@@ -763,7 +1092,7 @@ class RetailDataGenerator:
         sales = tx.group_by('store_id').agg(pl.sum('total_price').alias('total_sales'))
         order_counts = orders.group_by('store_id').len().rename({'len': 'order_count'})
         store_metrics = store_metrics.join(sales, on='store_id', how='left') \
-                                     .join(order_counts, on='store_id', how='left')
+                                    .join(order_counts, on='store_id', how='left')
 
         store_metrics = store_metrics.with_columns(
             (pl.col('total_sales') / pl.col('order_count')).alias('avg_order_value_store')
@@ -804,24 +1133,12 @@ class RetailDataGenerator:
         total_cost = return_cost['estimated_cost'].sum()
         return pl.DataFrame([{'total_return_cost': total_cost}])
 
-    def write(self, uri: str, data: Dict[str, pl.DataFrame]):
-        parsed = urlparse(uri)
-        scheme = parsed.scheme or "file"
-        path = uri.replace(f"{scheme}://", "", 1)
-
-        factory = self._SINK_REGISTRY.get(scheme)
-        if not factory:
-            raise ValueError(f"Unsupported storage scheme: '{scheme}'")
-
-        sink = factory(path if scheme != "postgresql" else uri, self)
-        sink.write(data)
-
     def generate_retail_data(self) -> Dict[str, pl.DataFrame]:
         customers=self.generate_customers(); 
         stores=self.generate_stores(); 
         suppliers=self.generate_suppliers()
         products=self.generate_products(suppliers)
-        transactions, orders = self.generate_orders_and_transactions(customers, stores, products, suppliers)
+        transactions, orders = self.generate_orders_and_transactions(customers, stores, products)
         inventory = self.simulate_inventory(transactions, products)
         
         return {
@@ -852,11 +1169,11 @@ class RetailDataGenerator:
             raise
 
         try:
-            logger.info(f"📦 Writing raw data to `{self.spec.destination}/raw`...")
-            self.write(uri=self.spec.destination + "/raw", data=retail_data)
+            logger.info(f"📦 Writing raw data to raw`...")
+            self.sink.write(data=retail_data, destination="raw")
 
-            logger.info(f"📦 Writing metrics to `{self.spec.destination}/metrics`...")
-            self.write(uri=self.spec.destination + "/mart", data=metrics)
+            logger.info(f"📦 Writing metrics to mart`...")
+            self.sink.write(data=metrics, destination="mart")
         except Exception as e:
             logger.error(f"❌ Error writing to sink: {e}")
             raise
@@ -865,110 +1182,89 @@ class RetailDataGenerator:
         logger.info(f"🏁 Synthetic retail data generation complete in {elapsed:.2f}s")
         return retail_data
 
-
-# Define Clusterization Types as Labels
-class ClusterizationType:
-    GEOGRAPHIC_EXPANSION = "geographic"
-    ECONOMIC_SEGMENTS = "economic"
-    MARKET_MATURITY = "maturity"
-
-# Cluster Data Template
-CLUSTER_DATA = {
-    ClusterizationType.GEOGRAPHIC_EXPANSION: [
-        {"name": "LATAM", "lat": -23.5505, "lon": -46.6333, "radius_km": 100, "num_stores": 5, "weight": 0.5, 
-         "channel_weights": {"online": 0.3, "in_store": 0.7}, "income_dist": {"low": 0.4, "medium": 0.4, "high": 0.2}, "age_range": [20, 65]},
-        {"name": "EMEA", "lat": 48.8566, "lon": 2.3522, "radius_km": 80, "num_stores": 3, "weight": 0.3},
-        {"name": "APAC", "lat": 35.6895, "lon": 139.6917, "radius_km": 60, "num_stores": 4, "weight": 0.2}
-    ],
-    
-    ClusterizationType.ECONOMIC_SEGMENTS: [
-        {"name": "LATAM", "lat": -23.5505, "lon": -46.6333, "radius_km": 100, "num_stores": 5, "weight": 0.5,
-         "channel_weights": {"online": 0.3, "in_store": 0.7}, "income_dist": {"low": 0.6, "medium": 0.3, "high": 0.1}, "age_range": [20, 65]},
-        {"name": "EMEA", "lat": 48.8566, "lon": 2.3522, "radius_km": 80, "num_stores": 3, "weight": 0.3,
-         "channel_weights": {"online": 0.5, "in_store": 0.5}, "income_dist": {"low": 0.3, "medium": 0.5, "high": 0.2}, "age_range": [25, 60]},
-        {"name": "APAC", "lat": 35.6895, "lon": 139.6917, "radius_km": 60, "num_stores": 4, "weight": 0.2,
-         "channel_weights": {"online": 0.4, "in_store": 0.6}, "income_dist": {"low": 0.4, "medium": 0.4, "high": 0.2}, "age_range": [18, 55]}
-    ],
-    
-    ClusterizationType.MARKET_MATURITY: [
-        {"name": "LATAM", "lat": -23.5505, "lon": -46.6333, "radius_km": 100, "num_stores": 5, "weight": 0.5,
-         "channel_weights": {"online": 0.2, "in_store": 0.8}, "income_dist": {"low": 0.5, "medium": 0.4, "high": 0.1}, "age_range": [20, 65]},
-        {"name": "EMEA", "lat": 48.8566, "lon": 2.3522, "radius_km": 80, "num_stores": 3, "weight": 0.3,
-         "channel_weights": {"online": 0.5, "in_store": 0.5}, "income_dist": {"low": 0.2, "medium": 0.5, "high": 0.3}, "age_range": [25, 60]},
-        {"name": "APAC", "lat": 35.6895, "lon": 139.6917, "radius_km": 60, "num_stores": 4, "weight": 0.2,
-         "channel_weights": {"online": 0.3, "in_store": 0.7}, "income_dist": {"low": 0.3, "medium": 0.5, "high": 0.2}, "age_range": [18, 55]}
-    ]
-}
-
-# Create a function to generate GeoClusters based on the strategy type
-def generate_geo_clusters(clusterization_type: str) -> List[GeoClusterSpec]:
-    if clusterization_type not in CLUSTER_DATA:
-        raise ValueError(f"Unknown clusterization type: {clusterization_type}")
-    
-    clusters = []
-    for cluster_info in CLUSTER_DATA[clusterization_type]:
-        clusters.append(GeoClusterSpec(**cluster_info))  # Unpack dictionary directly into GeoClusterSpec
-    
-    return clusters
-
-import argparse
-
-def main():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate synthetic retail data and metrics.")
-    
-    # Arguments for general data generation
+
+    parser.add_argument("--num_customers", type=int, default=500, help="Number of customers to generate")
+    parser.add_argument("--num_products", type=int, default=2000, help="Number of products to generate")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--destination", type=str, default="./data", help="Data sink URI (e.g. s3://bucket or ./data)")
     parser.add_argument(
-        "--num_customers", type=int, default=500, 
-        help="Number of customers to generate"
+        "--format", 
+        type=str, 
+        choices=["parquet", "csv", "xls", "xlsx", "jsonl"],
+        default="parquet",
+        help="File format to use for data output"
     )
     parser.add_argument(
-        "--num_products", type=int, default=2000, 
-        help="Number of products to generate"
-    )
-    parser.add_argument(
-        "--num_transactions", type=int, default=10000, 
-        help="Number of transactions to generate"
-    )
-    parser.add_argument(
-        "--num_stores", type=int, default=10, 
-        help="Number of stores to generate"
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42, 
-        help="Random seed for reproducibility"
-    )
-    parser.add_argument(
-        "--destination", type=str, default='./data', 
-        help="Data sink URI (e.g. duckdb://data.db or ./data)"
-    )
-    
-    # Argument for clusterization type
-    parser.add_argument(
-        "--clusterization_type", type=str, choices=[ClusterizationType.GEOGRAPHIC_EXPANSION, 
-                                                   ClusterizationType.ECONOMIC_SEGMENTS, 
-                                                   ClusterizationType.MARKET_MATURITY], 
-        default=ClusterizationType.GEOGRAPHIC_EXPANSION,
+        "--clusterization_type", 
+        type=str, 
+        choices=[e.name for e in ClusterizationType], 
+        default=ClusterizationType.GEOGRAPHIC_EXPANSION.name,
         help="Specify the clusterization type"
     )
+    return parser.parse_args()
 
-    args = parser.parse_args()
-
-    # Generate geo clusters based on the specified clusterization type
-    geo_clusters = generate_geo_clusters(args.clusterization_type)
-
-    # Build spec from CLI args
-    spec = RetailDataSpec(
+def build_retail_spec(args: argparse.Namespace) -> RetailDataSpec:
+    cluster_type = ClusterizationType[args.clusterization_type]
+    geo_clusters = cluster_config[cluster_type]
+    return RetailDataSpec(
         num_customers=args.num_customers,
         num_products=args.num_products,
-        num_transactions=args.num_transactions,
         seed=args.seed,
-        destination=args.destination or RetailDataSpec().destination,
+        destination=args.destination,
         geo_clusters=geo_clusters
     )
 
-    # Run generator
-    gen = RetailDataGenerator(spec)
-    gen.run()
+def get_sink(destination: str, file_format: str) -> SinkContext:
+    """
+    Retrieves the correct sink based on the destination and file format.
+
+    Args:
+        destination (str): The URL or path specifying the sink location.
+        file_format (str): The desired file format (e.g., 'csv', 'parquet').
+
+    Returns:
+        SinkContext: The appropriate sink context for the given destination and file format.
+
+    Raises:
+        ValueError: If no sink is registered for the specified scheme and file format.
+        NotImplementedError: If the scheme is not yet supported.
+    """
+    # Parse the destination URI
+    uri = urlparse(destination)
+    scheme = uri.scheme or "file"  # default to local filesystem if no scheme
+
+    # Check for valid scheme + file_format in the registry
+    try:
+        sink_class = SINK_REGISTRY[(scheme, file_format)]
+    except KeyError:
+        raise ValueError(f"No sink registered for scheme '{scheme}' and format '{file_format}'. Available formats for scheme '{scheme}': {', '.join([fmt for _, fmt in SINK_REGISTRY if _ == scheme])}")
+
+    # Scheme-specific instantiation logic
+    scheme_handlers = {
+        "s3": lambda: sink_class(bucket=uri.netloc, prefix=uri.path.strip("/")),
+        "gcs": lambda: sink_class(path=destination),
+        "file": lambda: sink_class(base_path=uri.path),
+        "": lambda: sink_class(base_path=uri.path),  # Handle empty scheme as 'file'
+        "duckdb": lambda: sink_class(db_path=uri.path)
+    }
+
+    # Retrieve the appropriate handler, raise NotImplementedError if the scheme isn't supported
+    handler = scheme_handlers.get(scheme)
+    if handler:
+        return handler()
+    else:
+        raise NotImplementedError(f"Sink scheme '{scheme}' is not yet supported.")
+
+def main():
+    args = parse_args()
+    
+    spec = build_retail_spec(args)
+    sink = get_sink(args.destination, args.format)
+    
+    generator = RetailDataGenerator(spec, sink)
+    generator.run()
 
 if __name__ == '__main__':
     main()
