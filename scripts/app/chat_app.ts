@@ -94,10 +94,14 @@ async function onFetchResponse(response: Response): Promise<void> {
 }
 
 function onError(error: any) {
-  console.error(error)
-  document.getElementById('error')?.classList.remove('d-none')
-  spinner.classList.remove('active')
+  console.error(error);
+  document.getElementById('error')?.classList.remove('d-none');
+  spinner.classList.remove('active');
+  const errorMessage = document.createElement('div');
+  errorMessage.textContent = "Something went wrong. Please try again.";
+  document.getElementById('error')?.appendChild(errorMessage);
 }
+
 
 async function onSubmit(e: SubmitEvent): Promise<void> {
   e.preventDefault()

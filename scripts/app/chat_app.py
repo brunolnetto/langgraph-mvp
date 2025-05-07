@@ -97,11 +97,18 @@ def to_chat_message(m: ModelMessage) -> ChatMessage:
             }
     raise UnexpectedModelBehavior(f'Unexpected message type for chat app: {m}')
 
+from pydantic import BaseModel
+
+class PromptRequest(BaseModel):
+    prompt: str
 
 @app.post('/chat/')
 async def post_chat(
-    prompt: Annotated[str, fastapi.Form()], database: Database = Depends(get_db)
+    request: PromptRequest, database: Database = Depends(get_db)
 ) -> StreamingResponse:
+    prompt = request.prompt
+    print(prompt)
+    
     async def stream_messages():
         """Streams new line delimited JSON `Message`s to the client."""
         # stream the user prompt so that can be displayed straight away
