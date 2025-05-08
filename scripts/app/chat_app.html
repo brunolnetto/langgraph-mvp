@@ -27,28 +27,58 @@
       background-color: #f8f9fa;
       transition: background-color 0.3s, color 0.3s;
       color: var(--text-color);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
     }
 
     main {
       max-width: 700px;
+      width: 100%;
       background-color: #ffffff;
       box-shadow: 0 0.25rem 1rem var(--shadow-color);
       border-radius: 1rem;
       padding: 2rem;
       transition: background-color 0.3s, box-shadow 0.3s;
+      margin: auto;
+      display: flex;
+      flex-direction: column;
+      height: 90vh;
+      max-height: 800px;
+    }
+
+    .app-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 1rem;
+      border-bottom: 1px solid var(--border-color);
+      flex-shrink: 0;
+    }
+
+    .app-body {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      margin-top: 1rem;
     }
 
     #conversation-wrapper {
       border: 1px solid var(--border-color);
       border-radius: 0.75rem;
-      margin-bottom: 1.5rem;
+      margin-bottom: 1rem;
       background-color: rgba(255, 255, 255, 0.5);
+      flex: 1;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
     }
 
     #conversation {
       display: flex;
       flex-direction: column;
-      height: 400px;
+      flex: 1;
       overflow-y: auto;
       padding: 1rem;
       scroll-behavior: smooth;
@@ -82,6 +112,7 @@
 
     .message-content {
       line-height: 1.5;
+      word-break: break-word;
     }
 
     #conversation .user {
@@ -106,12 +137,6 @@
       max-width: 80%;
       align-self: flex-start;
       margin-right: auto;
-      opacity: 0;
-      transition: opacity 0.3s ease;
-    }
-
-    .thinking.active {
-      opacity: 1;
     }
 
     .dot-typing {
@@ -145,6 +170,7 @@
 
     .form-container {
       position: relative;
+      flex-shrink: 0;
     }
 
     input.form-control {
@@ -187,40 +213,13 @@
       cursor: not-allowed;
     }
 
-    #spinner {
-      width: 20px;
-      height: 20px;
-      border: 2px solid #fff;
-      border-bottom-color: transparent;
-      border-radius: 50%;
-      animation: rotation 1s linear infinite;
-      display: none;
-    }
-
-    #spinner.active {
-      display: block;
-    }
-
-    @keyframes rotation {
-      0% { transform: rotate(0deg); }
-      100% { transform: rotate(360deg); }
-    }
-
     #error {
       margin-top: 1rem;
       padding: 0.75rem;
       border-radius: 0.5rem;
       background-color: #ffebee;
       border: 1px solid #ffcdd2;
-    }
-
-    .app-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 1.5rem;
-      padding-bottom: 1rem;
-      border-bottom: 1px solid var(--border-color);
+      flex-shrink: 0;
     }
 
     .toggle-theme {
@@ -276,258 +275,134 @@
       color: #e0e0e0;
     }
     
-  </style>
-</head>
-<body>
-  <main class="mx-auto my-5">
-    <div class="app-header">
-      <h1><i class="fas fa-comments me-2"></i>Chat App</h1>
-      <button class="toggle-theme border-0" id="theme-toggle" aria-label="Toggle theme">
-        <i class="fas fa-sun"></i>
-      </button>
-    </div>
-    <p class="text-muted mb-4">Ask me anything...</p>
-
-    <div id="conversation-wrapper">
-      <div id="conversation">
-        <!-- Messages will appear here -->
-        <!-- Thinking indicator -->
-        <div id="thinking" class="thinking">
-          <div class="message-header">
-            <i class="fas fa-robot"></i>AI thinking
-          </div>
-          <div class="dot-typing">
-            <div class="dot"></div>
-            <div class="dot"></div>
-            <div class="dot"></div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <form id="chat-form" method="post">
-      <div class="form-container">
-        <input
-          id="prompt-input"
-          name="prompt"
-          class="form-control"
-          placeholder="Type your message here..."
-          autocomplete="off"
-        />
-        <button type="submit" class="send-button" id="send-button">
-          <div id="spinner"></div>
-          <i class="fas fa-paper-plane" id="send-icon"></i>
-        </button>
-      </div>
-    </form>
-
-    <div id="error" class="d-none">
-      <i class="fas fa-exclamation-circle me-2"></i>
-      Error occurred, check the browser developer console for more information.
-    </div>
-  </main>
-
-  <script>
-    // Theme Toggle Functionality
-    function toggleTheme() {
-      const body = document.body;
-      const icon = document.querySelector('#theme-toggle i');
-
-      body.classList.toggle('dark-mode');
-      
-      // Switch icon based on theme
-      if (body.classList.contains('dark-mode')) {
-        icon.className = 'fas fa-moon';
-        localStorage.setItem('theme', 'dark');
-      } else {
-        icon.className = 'fas fa-sun';
-        localStorage.setItem('theme', 'light');
-      }
-    }
-
-    // Load saved theme preference
-    function loadTheme() {
-      const savedTheme = localStorage.getItem('theme');
-      const themeToggle = document.getElementById('theme-toggle');
-      
-      if (savedTheme === 'dark') {
-        document.body.classList.add('dark-mode');
-        themeToggle.querySelector('i').className = 'fas fa-moon';
-      }
-      
-      themeToggle.addEventListener('click', toggleTheme);
+    /* Dark mode message colors */
+    body.dark-mode #conversation .user {
+      background-color: var(--user-bg);
+      color: #ffffff;
     }
     
-    // Scroll to bottom of conversation
-    function scrollToBottom() {
-      const conversation = document.getElementById('conversation');
-      conversation.scrollTop = conversation.scrollHeight;
+    body.dark-mode #conversation .model {
+      background-color: var(--model-bg);
+      color: #e0e0e0;
     }
-
-    // Show thinking indicator
-    function showThinking(show) {
-      const thinking = document.getElementById('thinking');
-      if (show) {
-        thinking.classList.add('active');
-      } else {
-        thinking.classList.remove('active');
+    
+    body.dark-mode .thinking {
+      background-color: var(--model-bg);
+      color: #e0e0e0;
+    }
+    
+    /* Loading spinner animation */
+    @keyframes rotate {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+    
+    /* Responsive design improvements */
+    @media (max-width: 768px) {
+      main {
+        margin: 0.5rem auto;
+        padding: 1rem;
+        height: calc(100vh - 1rem);
+        max-height: none;
+        border-radius: 0.5rem;
       }
-      if (show) scrollToBottom();
+      
+      #conversation .user,
+      #conversation .model {
+        max-width: 90%;
+      }
     }
+    
+    /* Hide the thinking element initially */
+    #thinking {
+      display: none;
+    }
+    
+    /* Add d-none utility class for compatibility */
+    .d-none {
+      display: none !important;
+    }
+  </style>
+  </head>
+  <body>
+    <main>
+      <div class="app-header">
+        <h1><i class="fas fa-comments me-2"></i>Chat App</h1>
+        <button class="toggle-theme border-0" id="theme-toggle" aria-label="Toggle theme">
+          <i class="fas fa-sun" id="theme-icon"></i>
+        </button>
+      </div>
 
-    // Add a message to the conversation
-    function addMessage(userMessage, modelMessage) {
-      const conversation = document.getElementById('conversation');
-      const thinking = document.getElementById('thinking');
-      
-      // Create user message
-      const userDiv = document.createElement('div');
-      userDiv.classList.add('message-wrapper');
-      userDiv.innerHTML = `
-        <div class="user">
-          <div class="message-header">
-            <i class="fas fa-user"></i>You
-          </div>
-          <div class="message-content">${userMessage}</div>
-        </div>
-      `;
-      
-      // Add user message before the thinking indicator
-      conversation.insertBefore(userDiv, thinking);
-      scrollToBottom();
-      
-      // Show thinking indicator
-      showThinking(true);
-      
-      // Simulate AI response delay (remove this in production with real API)
-      setTimeout(() => {
-        // Hide thinking indicator
-        showThinking(false);
-        
-        // Create AI message
-        const modelDiv = document.createElement('div');
-        modelDiv.classList.add('message-wrapper');
-        modelDiv.innerHTML = `
-          <div class="model">
-            <div class="message-header">
-              <i class="fas fa-robot"></i>AI Assistant
+      <div class="app-body">
+        <p class="text-muted">Ask me anything...</p>
+
+        <div id="conversation-wrapper">
+          <div id="conversation" aria-live="polite">
+            <!-- Messages will appear here -->
+
+            <!-- Thinking indicator -->
+            <div id="thinking" class="thinking d-none">
+              <div class="message-header">
+                <i class="fas fa-robot"></i> AI thinking
+              </div>
+              <div class="dot-typing">
+                <div class="dot"></div>
+                <div class="dot"></div>
+                <div class="dot"></div>
+              </div>
             </div>
-            <div class="message-content">${modelMessage}</div>
           </div>
-        `;
-        
-        // Add AI message before the thinking indicator
-        conversation.insertBefore(modelDiv, thinking);
-        scrollToBottom();
-      }, 1500); // Simulate API delay - replace with actual API response time
+        </div>
+
+        <form id="chat-form" autocomplete="off" novalidate>
+          <div class="form-container">
+            <label for="prompt-input" class="visually-hidden">Your message</label>
+            <input
+              id="prompt-input"
+              name="prompt"
+              class="form-control"
+              placeholder="Type your message here..."
+              autocomplete="off"
+            />
+            <button type="submit" class="send-button" id="send-button" aria-label="Send message">
+              <i class="fas fa-paper-plane" id="send-icon"></i>
+              <i class="fas fa-spinner fa-spin d-none" id="spinner-icon"></i>
+            </button>
+          </div>
+        </form>
+
+        <div id="error" class="d-none text-danger mt-3">
+          <i class="fas fa-exclamation-circle me-2"></i>
+          Error occurred, check the browser developer console for more information.
+        </div>
+      </div>
+    </main>
+
+  <!-- TypeScript transpiler -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/typescript/5.6.3/typescript.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script type="module">
+    async function loadTs() {
+      try {
+        const response = await fetch('/chat_app.ts');
+        if (!response.ok) {
+          throw new Error(`Failed to load TypeScript: ${response.status}`);
+        }
+        const tsCode = await response.text();
+        const jsCode = window.ts.transpile(tsCode, { target: "es2015" });
+        const script = document.createElement('script');
+        script.type = 'module';
+        script.text = jsCode;
+        document.body.appendChild(script);
+      } catch (e) {
+        console.error('Error loading TypeScript:', e);
+        document.getElementById('error')?.classList.remove('d-none');
+      }
     }
 
-    // Handle form submission
-    function setupFormHandler() {
-      const form = document.getElementById('chat-form');
-      const input = document.getElementById('prompt-input');
-      const sendButton = document.getElementById('send-button');
-      const sendIcon = document.getElementById('send-icon');
-      const spinner = document.getElementById('spinner');
-
-      form.addEventListener('submit', async (e) => {
-        e.preventDefault();
-
-        const userMessage = input.value.trim();
-        if (!userMessage) return;
-
-        // Disable input and show loading state
-        input.disabled = true;
-        sendButton.disabled = true;
-        sendIcon.style.display = 'none';
-        spinner.classList.add('active');
-
-        try {
-          console.log(JSON.stringify({ prompt: userMessage }));
-          const response = await fetch('/chat/', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ prompt: userMessage })
-          });
-          
-          if (!response.ok) {
-            throw new Error('Network response was not ok');
-          }
-
-          const reader = response.body.getReader();
-          const decoder = new TextDecoder();
-          let fullResponse = '';
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            fullResponse += decoder.decode(value, { stream: true });
-          }
-
-          // Add the messages to the conversation
-          addMessage(userMessage, fullResponse.trim());
-
-          // Clear input
-          input.value = '';
-        } catch (error) {
-          console.error('Error:', error);
-          document.getElementById('error').classList.remove('d-none');
-        } finally {
-          input.disabled = false;
-          sendButton.disabled = false;
-          sendIcon.style.display = 'block';
-          spinner.classList.remove('active');
-          input.focus();
-        }
-      });
-    }
-
-
-    // Initialize the app
-    window.addEventListener('DOMContentLoaded', () => {
-      loadTheme();
-      setupFormHandler();
-      scrollToBottom();
-      
-      // Hide thinking indicator on load
-      showThinking(false);
-      
-      // Add some example messages if conversation is empty
-      setTimeout(() => {
-        const conversation = document.getElementById('conversation');
-        if (conversation.children.length <= 1) { // Only thinking indicator
-          addMessage("Hello! How can you help me?", "Hi there! I'm your AI assistant. Feel free to ask me anything!");
-        }
-      }, 500);
+    loadTs().catch((e) => {
+      console.error(e);
+      document.getElementById('error')?.classList.remove('d-none');
     });
-
-    // Ensure scroll always follows new content
-    const conversationElem = document.getElementById('conversation');
-    const observer = new MutationObserver(scrollToBottom);
-    observer.observe(conversationElem, { childList: true, subtree: true });
   </script>
 </body>
-
-<!-- TypeScript transpiler -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/typescript/5.6.3/typescript.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
-<script type="module">
-  async function loadTs() {
-    try {
-      const response = await fetch('/chat_app.ts');
-      const tsCode = await response.text();
-      const jsCode = window.ts.transpile(tsCode, { target: "es2015" });
-      const script = document.createElement('script');
-      script.type = 'module';
-      script.text = jsCode;
-      document.body.appendChild(script);
-    } catch (e) {
-      console.error('Error loading TypeScript:', e);
-      document.getElementById('error')?.classList.remove('d-none');
-    }
-  }
-
-  loadTs().catch((e) => {
-    console.error(e);
-    document.getElementById('error')?.classList.remove('d-none');
-  });
-</script>
+</html>
