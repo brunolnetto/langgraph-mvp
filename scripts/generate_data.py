@@ -6,9 +6,9 @@ from time import perf_counter
 from enum import Enum
 import logging
 from urllib.parse import urlparse
-from copy import deepcopy
 from uuid import uuid4
 import argparse
+from abc import ABC, abstractmethod
 from datetime import date, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -17,22 +17,20 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from collections import defaultdict
 import datetime
+from dateutil.relativedelta import relativedelta
+import math
 
-import fastavro
 from pydantic import BaseModel, Field, model_validator, field_validator
 from pydantic.functional_validators import AfterValidator
 import polars as pl
 import pandas as pd
-import pyarrow as pa
-import pyarrow.orc as orc
 import numpy as np
 import duckdb
 from boto3 import client as boto_client
 from gcsfs import GCSFileSystem
 from sqlalchemy import create_engine, text
 from faker import Faker
-from dateutil.relativedelta import relativedelta
-import math
+
 
 logger = logging.getLogger("retail_gen")
 logger.setLevel(logging.INFO)
@@ -398,8 +396,6 @@ def estimate_sla_days(from_loc, to_loc, base=500, jitter=True):
 # ----------------------------# 
 
 # === Protocols ===
-from abc import ABC, abstractmethod
-
 class DataSink(Protocol):
     @property
     @abstractmethod
@@ -486,111 +482,6 @@ class FeatherHandler(FileFormatHandler):
     def read(self, path: Path) -> pl.DataFrame:
         return pl.read_ipc(path)
 
-class AvroHandler(FileFormatHandler):
-    def _convert_to_avro_compatible(self, value: Any) -> Any:
-        if isinstance(value, (datetime.date, datetime.datetime)):
-            return value.isoformat()
-        return value
-
-    def _polars_dtype_to_avro_type(self, dtype: pl.DataType) -> Union[str, Dict[str, str]]:
-        if dtype == pl.Utf8:
-            return "string"
-        elif dtype in [pl.Int8, pl.Int16, pl.Int32]:
-            return "int"
-        elif dtype == pl.Int64:
-            return "long"
-        elif dtype in [pl.Float32]:
-            return "float"
-        elif dtype == pl.Float64:
-            return "double"
-        elif dtype == pl.Boolean:
-            return "boolean"
-        elif dtype == pl.Date:
-            return {"type": "int", "logicalType": "date"}
-        elif dtype == pl.Datetime:
-            return {"type": "long", "logicalType": "timestamp-ms"} # Assuming millisecond precision
-        else:
-            return "string" # Default to string for unknown types
-
-    def write(self, df: pl.DataFrame, path: Path):
-        try:
-            # Convert DataFrame to a list of dictionaries, applying Avro compatibility
-            records = [
-                {col: self._convert_to_avro_compatible(row[i]) for i, col in enumerate(df.columns)}
-                for row in df.rows()
-            ]
-
-            # Define Avro schema based on Polars dtypes
-            schema = {
-                "type": "record",
-                "name": "Record",
-                "fields": [
-                    {"name": col, "type": self._polars_dtype_to_avro_type(df.dtypes[i])}
-                    for i, col in enumerate(df.columns)
-                ]
-            }
-
-            with open(path, "wb") as f:
-                fastavro.writer(f, schema, records)
-
-        except Exception as e:
-            raise IOError(f"Error writing Avro file to '{path}': {e}")
-
-    def read(self, path: Path) -> pl.DataFrame:
-        try:
-            with open(path, "rb") as f:
-                reader = fastavro.reader(f)
-                records = [record for record in reader]
-            return pl.DataFrame(records)
-        except FileNotFoundError:
-            raise FileNotFoundError(f"Avro file not found at '{path}'")
-        except Exception as e:
-            raise IOError(f"Error reading Avro file from '{path}': {e}")
-
-class ORCHandler(FileFormatHandler):
-    def _prepare_for_arrow(self, df: pl.DataFrame) -> pl.DataFrame:
-        prepared_df = df.clone()
-        for col in prepared_df.columns:
-            dtype = prepared_df.dtypes[prepared_df.columns.index(col)]
-            if dtype == pl.UInt32:
-                prepared_df = prepared_df.with_columns(pl.col(col).cast(pl.Int64))
-                print(f"Casting column '{col}' from UInt32 to Int64 for ORC compatibility.")
-            elif dtype == pl.UInt8:
-                prepared_df = prepared_df.with_columns(pl.col(col).cast(pl.Int16))
-                print(f"Casting column '{col}' from UInt8 to Int16 for ORC compatibility.")
-            elif dtype == pl.UInt16:
-                prepared_df = prepared_df.with_columns(pl.col(col).cast(pl.Int32))
-                print(f"Casting column '{col}' from UInt16 to Int32 for ORC compatibility.")
-            elif prepared_df[col].null_count() == prepared_df.height:
-                # If all values in the column are null, cast to a nullable string
-                prepared_df = prepared_df.with_columns(pl.col(col).cast(pl.Utf8))
-                print(f"Casting column '{col}' (all nulls) to Utf8 for ORC compatibility.")
-        return prepared_df
-
-    def write(self, df: pl.DataFrame, path: Path):
-        try:
-            prepared_df = self._prepare_for_arrow(df)
-            table = pa.Table.from_pandas(prepared_df.to_pandas())
-
-            with open(path, "wb") as f:
-                orc.write_table(table, f)
-        except ImportError:
-            raise ImportError("pyarrow and pyarrow.orc are required to write ORC files. Please install them.")
-        except Exception as e:
-            raise IOError(f"Error writing ORC file to '{path}': {e}")
-
-    def read(self, path: Path) -> pl.DataFrame:
-        try:
-            with open(path, "rb") as f:
-                table = orc.ORCFile(f).read()
-            return pl.from_arrow(table)
-        except FileNotFoundError:
-            raise FileNotFoundError(f"ORC file not found at '{path}'")
-        except ImportError:
-            raise ImportError("pyarrow and pyarrow.orc are required to read ORC files. Please install them.")
-        except Exception as e:
-            raise IOError(f"Error reading ORC file from '{path}': {e}")
-
 FORMAT_HANDLERS = {
     'csv': CSVHandler(),
     'parquet': ParquetHandler(),
@@ -599,8 +490,6 @@ FORMAT_HANDLERS = {
     'feather': FeatherHandler(),
     'xls': ExcelHandler(),
     'xlsx': ExcelHandler(),
-    'avro': AvroHandler(),
-    'orc': ORCHandler(),
 }
 
 AVAILABLE_FORMATS = tuple(FORMAT_HANDLERS.keys())
@@ -796,6 +685,54 @@ class GCSSink(CloudFileSink):
     def read(self, source: Optional[str] = None) -> Dict[str, pl.DataFrame]:
         raise NotImplementedError("Reading from GCS not implemented")
 
+def get_sink(destination: str, file_format: str) -> SinkContext:
+    """
+    Retrieves the correct sink based on the destination and file format.
+
+    Args:
+        destination (str): The URL or path specifying the sink location.
+        file_format (str): The desired file format (e.g., 'csv', 'parquet').
+
+    Returns:
+        SinkContext: The appropriate sink context for the given destination and file format.
+
+    Raises:
+        ValueError: If no sink is registered for the specified scheme and file format.
+        NotImplementedError: If the scheme is not yet supported.
+    """
+    # Parse the destination URI
+    uri = urlparse(destination)
+    scheme = uri.scheme or "file"  # default to local filesystem if no scheme
+
+    # Check for valid scheme + file_format in the registry
+    try:
+        sink_class = SINK_REGISTRY[(scheme, file_format)]
+    except KeyError:
+        raise ValueError(f"No sink registered for scheme '{scheme}' and format '{file_format}'. Available formats for scheme '{scheme}': {', '.join([fmt for _, fmt in SINK_REGISTRY if _ == scheme])}")
+
+    # Scheme-specific instantiation logic
+    scheme_handlers = {
+        "file": lambda: sink_class(base_path=uri.path, file_format=file_format),
+        "s3": lambda: sink_class(
+            bucket=uri.netloc, prefix=uri.path.strip("/"), file_format=file_format
+        ),
+        "gcs": lambda: sink_class(
+            path=destination, file_format=file_format
+        ),
+        "": lambda: sink_class(base_path=uri.path, file_format=file_format),
+        "duckdb": lambda: sink_class(db_path=uri.path),
+        "mysql": lambda: sink_class(db_url=destination),
+        "postgresql": lambda: sink_class(db_url=destination),
+        "sqlite": lambda: sink_class(db_path=uri.path),
+    }
+
+    # Retrieve the appropriate handler, raise NotImplementedError if the scheme isn't supported
+    handler = scheme_handlers.get(scheme)
+    if handler:
+        return handler()
+    else:
+        raise NotImplementedError(f"Sink scheme '{scheme}' is not yet supported.")
+
 # ----------------------------
 # Business Layer
 # ----------------------------
@@ -852,9 +789,68 @@ class RetailDataSpec:
         assert self.num_products > 0
         assert self.geo_clusters, "❌ You must define at least one geo_cluster"
 
-class RetailDataGenerator:
+class BaseSpecification(ABC):
+    @abstractmethod
+    def generate(self) -> RetailDataSpec:
+        """Generate a RetailDataSpec instance."""
+        pass
+
+    @abstractmethod
+    def validate(self) -> None:
+        """Validate the generated specification."""
+        pass
+
+class DataGenerator(ABC):
     def __init__(self, spec: RetailDataSpec, sink: DataSink):
         self.spec = spec
+        self.sink = sink
+        self.data = {}
+    
+    def compute_metrics(self, data: Dict[str, pl.DataFrame]) -> Dict[str, pl.DataFrame]:
+        """Compute metrics from the generated data."""
+        # Placeholder for metric computation logic
+        # This should be implemented in subclasses
+        return {}
+    
+    def run(self) -> Dict[str, pl.DataFrame]:
+        """Generate data and return as a dictionary of DataFrames."""
+        start_time = perf_counter()
+
+        try:
+            logger.info("🛠️ Generating data")
+            data_dict = self.generate_data()
+        except Exception as e:
+            logger.error(f"❌ Error generating retail data: {e}")
+            raise
+
+        try:
+            logger.info("📊 Computing retail metrics...")
+            metrics_dict = self.compute_metrics(data_dict)
+        except Exception as e:
+            logger.error(f"❌ Error computing metrics: {e}")
+            raise
+
+        try:
+            logger.info(f"📦 Writing raw data to raw`...")
+            self.sink.write(data=data_dict, destination="raw")
+
+            logger.info(f"📦 Writing metrics to mart`...")
+            self.sink.write(data=metrics_dict, destination="mart")
+        except Exception as e:
+            logger.error(f"❌ Error writing to sink: {e}")
+            raise
+
+        elapsed = perf_counter() - start_time
+        logger.info(f"🏁 Synthetic data generation complete in {elapsed:.2f}s")
+        return {
+            "raw": data_dict,
+            "mart": metrics_dict
+        }
+
+class RetailDataGenerator(DataGenerator):
+    def __init__(self, spec: RetailDataSpec, sink: DataSink):
+        super().__init__(spec, sink)
+
         seed = spec.seed
 
         random.seed(seed)
@@ -863,7 +859,6 @@ class RetailDataGenerator:
         self.fake = Faker(seed) if seed is not None else Faker()
         self.geo_cluster_manager = GeoClusterManager(geo_clusters=spec.geo_clusters)
         self.stock_manager = StockManager(self.spec.initial_stock_range, Lock())
-        self.sink = sink
 
     def generate_customers(self) -> pl.DataFrame:
         start_date = parse_date(self.spec.reg_date_start)
@@ -917,35 +912,6 @@ class RetailDataGenerator:
 
         return pl.DataFrame(customers)
 
-    def generate_stores(self) -> pl.DataFrame:
-        stores = []
-        for cluster in self.spec.geo_clusters:
-            for _ in range(cluster.num_stores):
-                lat, lon = random_geo_around(cluster.lat, cluster.lon, cluster.radius_km)
-                stores.append({
-                    'store_id': self.fake.uuid4(),
-                    'latitude': round(lat, 6),
-                    'longitude': round(lon, 6),
-                    'region': cluster.name
-                })
-
-        logger.info(f"✅ {len(stores)} stores generated across {len(self.spec.geo_clusters)} clusters.")
-        return pl.DataFrame(stores)
-
-    def generate_suppliers(self) -> pl.DataFrame:
-        suppliers_df=pl.DataFrame([
-            {
-                "supplier_id": f"supplier_{i}",
-                "name": self.fake.company(),
-                "sla_days": random.randint(1, 7)  # basic SLA per supplier
-            }
-            for i in range(self.spec.supplier_pool_size)
-        ])
-
-        logger.info(f"✅ {len(suppliers_df)} suppliers generated.")
-        
-        return suppliers_df
-
     def generate_products(self, suppliers: Union[List[dict], pl.DataFrame]) -> pl.DataFrame:
         categories = self.spec.product_categories
         seasonality = self.spec.product_seasonality
@@ -988,6 +954,35 @@ class RetailDataGenerator:
         logger.info(f"✅ {len(products_df)} products generated.")
         return products_df
 
+    def generate_stores(self) -> pl.DataFrame:
+        stores = []
+        for cluster in self.spec.geo_clusters:
+            for _ in range(cluster.num_stores):
+                lat, lon = random_geo_around(cluster.lat, cluster.lon, cluster.radius_km)
+                stores.append({
+                    'store_id': self.fake.uuid4(),
+                    'latitude': round(lat, 6),
+                    'longitude': round(lon, 6),
+                    'region': cluster.name
+                })
+
+        logger.info(f"✅ {len(stores)} stores generated across {len(self.spec.geo_clusters)} clusters.")
+        return pl.DataFrame(stores)
+
+    def generate_suppliers(self) -> pl.DataFrame:
+        suppliers_df=pl.DataFrame([
+            {
+                "supplier_id": f"supplier_{i}",
+                "name": self.fake.company(),
+                "sla_days": random.randint(1, 7)  # basic SLA per supplier
+            }
+            for i in range(self.spec.supplier_pool_size)
+        ])
+
+        logger.info(f"✅ {len(suppliers_df)} suppliers generated.")
+        
+        return suppliers_df
+
     def generate_orders_and_transactions(
         self,
         customers: pl.DataFrame,
@@ -1004,11 +999,11 @@ class RetailDataGenerator:
         }
 
         stores_map = {s['store_id']: s for s in stores.to_dicts()}
-        store_ids = list(stores_map.keys())
         end = parse_date(self.spec.data_end)
 
         def generate_for_customer(cust):
-            region = self.geo_cluster_manager.assign_to_region(cust['latitude'], cust['longitude'])
+            lat, lng = cust['latitude'], cust['longitude']
+            region = self.geo_cluster_manager.assign_to_region(lat, lng)
             region_store_ids = [s['store_id'] for s in stores_map.values() if s.get('region') == region]
             if not region_store_ids:
                 return [], None
@@ -1033,10 +1028,8 @@ class RetailDataGenerator:
                 price_unit = price_map.get(pid, 1.0)
                 price_total = round(price_unit * actual_qty, 2)
 
-                dist = calculate_distance(
-                    cust['latitude'], cust['longitude'],
-                    stores_map[sid]['latitude'], stores_map[sid]['longitude']
-                )
+                store_lat, store_lng = stores_map[sid]['latitude'], stores_map[sid]['longitude']
+                dist = calculate_distance(lat, lng,store_lat, store_lng)
 
                 txn = {
                     'order_id': order_id,
@@ -1133,38 +1126,6 @@ class RetailDataGenerator:
             inventory.append({**txn, 'stock_before': before, 'stock_after': stock[key]})
 
         return pl.DataFrame(inventory)
-
-    def compute_metrics(self, data: Dict[str, pl.DataFrame]) -> Dict[str, pl.DataFrame]:
-        logger.info("🚀 Starting metric computation")
-        start_total = perf_counter()
-        results = {}
-
-        metrics_map = {
-            'customer_behavior_metrics': self._customer_metrics,
-            'customer_channel_preferences': self._customer_channel_preferences,
-            'order_summary_metrics': self._order_metrics,
-            'store_performance_metrics': self._store_metrics,
-            'store_channel_distribution': self._store_channel_distribution,
-            'product_return_analysis': self._product_return_analysis,
-            'return_behavior_outliers': self._identify_return_outliers,
-            'average_items_per_order': self._avg_items_per_order,
-            'estimated_total_return_cost': self._estimated_return_cost,
-        }
-
-        for name, func in metrics_map.items():
-            try:
-                logger.info(f"🔍 Computing `{name}`...")
-                start = perf_counter()
-                result = func(data)
-                elapsed = perf_counter() - start
-                results[name] = result
-                logger.info(f"✅ `{name}` computed in {elapsed:.3f}s — shape: {result.shape}")
-            except Exception as e:
-                logger.exception(f"❌ Failed to compute `{name}`: {e}")
-
-        total_elapsed = perf_counter() - start_total
-        logger.info(f"✅ All metrics computed in {total_elapsed:.2f}s")
-        return results
 
     def _customer_metrics(self, data: Dict[str, pl.DataFrame]) -> pl.DataFrame:
         tx = data['transactions']
@@ -1272,7 +1233,7 @@ class RetailDataGenerator:
         total_cost = return_cost['estimated_cost'].sum()
         return pl.DataFrame([{'total_return_cost': total_cost}])
 
-    def generate_retail_data(self) -> Dict[str, pl.DataFrame]:
+    def generate_data(self) -> Dict[str, pl.DataFrame]:
         customers=self.generate_customers(); 
         stores=self.generate_stores(); 
         suppliers=self.generate_suppliers()
@@ -1289,45 +1250,53 @@ class RetailDataGenerator:
             'transactions':transactions,
             'inventory': inventory,
         }
+    
+    def compute_metrics(self, data: Dict[str, pl.DataFrame]) -> Dict[str, pl.DataFrame]:
+        logger.info("🚀 Starting metric computation")
+        start_total = perf_counter()
+        results = {}
 
-    def run(self) -> Dict[str, pl.DataFrame]:
-        start_time = perf_counter()
+        metrics_map = {
+            'customer_behavior_metrics': self._customer_metrics,
+            'customer_channel_preferences': self._customer_channel_preferences,
+            'order_summary_metrics': self._order_metrics,
+            'store_performance_metrics': self._store_metrics,
+            'store_channel_distribution': self._store_channel_distribution,
+            'product_return_analysis': self._product_return_analysis,
+            'return_behavior_outliers': self._identify_return_outliers,
+            'average_items_per_order': self._avg_items_per_order,
+            'estimated_total_return_cost': self._estimated_return_cost,
+        }
 
-        try:
-            logger.info("🛒 Generating retail data...")
-            retail_data = self.generate_retail_data()
-        except Exception as e:
-            logger.error(f"❌ Error generating retail data: {e}")
-            raise
+        for name, func in metrics_map.items():
+            try:
+                logger.info(f"🔍 Computing `{name}`...")
+                start = perf_counter()
+                result = func(data)
+                elapsed = perf_counter() - start
+                results[name] = result
+                logger.info(f"✅ `{name}` computed in {elapsed:.3f}s — shape: {result.shape}")
+            except Exception as e:
+                logger.exception(f"❌ Failed to compute `{name}`: {e}")
 
-        try:
-            logger.info("📊 Computing retail metrics...")
-            metrics = self.compute_metrics(retail_data)
-        except Exception as e:
-            logger.error(f"❌ Error computing metrics: {e}")
-            raise
-
-        try:
-            logger.info(f"📦 Writing raw data to raw`...")
-            self.sink.write(data=retail_data, destination="raw")
-
-            logger.info(f"📦 Writing metrics to mart`...")
-            self.sink.write(data=metrics, destination="mart")
-        except Exception as e:
-            logger.error(f"❌ Error writing to sink: {e}")
-            raise
-
-        elapsed = perf_counter() - start_time
-        logger.info(f"🏁 Synthetic retail data generation complete in {elapsed:.2f}s")
-        return retail_data
+        total_elapsed = perf_counter() - start_total
+        logger.info(f"✅ All metrics computed in {total_elapsed:.2f}s")
+        return results
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate synthetic retail data and metrics.")
 
-    parser.add_argument("-c", "--num_customers", type=int, default=500, help="Number of customers to generate")
-    parser.add_argument("-p", "--num_products", type=int, default=2000, help="Number of products to generate")
-    parser.add_argument("-s", "--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("-d", "--destination", type=str, default="./data", help="Data sink URI (e.g. s3://bucket or ./data)")
+    parser.add_argument("-c", "--num_customers", type=int, 
+                        default=5000, help="Number of customers to generate")
+    parser.add_argument("-p", "--num_products", type=int, 
+                        default=10000, help="Number of products to generate"
+    )
+    parser.add_argument("-o", "--num_orders", type=int, 
+                        default=10000, help="Number of orders to generate")
+    parser.add_argument("-s", "--seed", type=int, 
+                        default=42, help="Random seed for reproducibility")
+    parser.add_argument("-d", "--destination", type=str, 
+                        default="./data", help="Data sink URI (e.g. s3://bucket or ./data)")
     parser.add_argument("-f", "--format", type=str, choices=AVAILABLE_FORMATS,
                         default="parquet", help="File format to use for data output")
     parser.add_argument("-t", "--clusterization_type", type=str,
@@ -1348,51 +1317,6 @@ def build_retail_spec(args: argparse.Namespace) -> RetailDataSpec:
         destination=args.destination,
         geo_clusters=geo_clusters
     )
-
-def get_sink(destination: str, file_format: str) -> SinkContext:
-    """
-    Retrieves the correct sink based on the destination and file format.
-
-    Args:
-        destination (str): The URL or path specifying the sink location.
-        file_format (str): The desired file format (e.g., 'csv', 'parquet').
-
-    Returns:
-        SinkContext: The appropriate sink context for the given destination and file format.
-
-    Raises:
-        ValueError: If no sink is registered for the specified scheme and file format.
-        NotImplementedError: If the scheme is not yet supported.
-    """
-    # Parse the destination URI
-    uri = urlparse(destination)
-    scheme = uri.scheme or "file"  # default to local filesystem if no scheme
-
-    # Check for valid scheme + file_format in the registry
-    try:
-        sink_class = SINK_REGISTRY[(scheme, file_format)]
-    except KeyError:
-        raise ValueError(f"No sink registered for scheme '{scheme}' and format '{file_format}'. Available formats for scheme '{scheme}': {', '.join([fmt for _, fmt in SINK_REGISTRY if _ == scheme])}")
-
-    # Scheme-specific instantiation logic
-    scheme_handlers = {
-        "s3": lambda: sink_class(
-            bucket=uri.netloc, prefix=uri.path.strip("/"), file_format=file_format
-        ),
-        "gcs": lambda: sink_class(
-            path=destination, file_format=file_format
-        ),
-        "file": lambda: sink_class(base_path=uri.path, file_format=file_format),
-        "": lambda: sink_class(base_path=uri.path, file_format=file_format),
-        "duckdb": lambda: sink_class(db_path=uri.path)
-    }
-
-    # Retrieve the appropriate handler, raise NotImplementedError if the scheme isn't supported
-    handler = scheme_handlers.get(scheme)
-    if handler:
-        return handler()
-    else:
-        raise NotImplementedError(f"Sink scheme '{scheme}' is not yet supported.")
 
 def main():
     args = parse_args()
